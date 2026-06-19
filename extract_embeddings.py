@@ -66,7 +66,8 @@ def extract_embeddings(
 
 if __name__ == "__main__":
     seqs = np.load('output/NPC1_mut_seq.npy')
-    embeddings = extract_embeddings(seqs, MODEL_ID, LAYER_NAME, BATCH_SIZE)
+    model = Evo2("evo2_7b")
+    embeddings = extract_embeddings(seqs, model, LAYER_NAME, BATCH_SIZE)
     np.save("embeddings.npy", embeddings)
 
                 
