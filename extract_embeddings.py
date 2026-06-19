@@ -4,6 +4,7 @@ from evo2 import Evo2
 
 MODEL_ID = "arcinstitute/evo2_7b" 
 LAYER_NAME = 'blocks.28.mlp.l3'
+PAD_ID = 0
 BATCH_SIZE = 8
 DEVICE = ("cuda" if torch.cuda.is_available()
           else "mps" if torch.backends.mps.is_available()
@@ -24,6 +25,7 @@ def extract_embeddings(
     model,
     layer: str = LAYER_NAME,
     batch_size: int = BATCH_SIZE,
+    pad_id: int = PAD_ID
 ) -> np.ndarray:
 
 
@@ -40,8 +42,8 @@ def extract_embeddings(
         seqs = sequences[start:start + batch_size]
         token_ids = [model.tokenizer.tokenize(seq) for seq in seqs]
         lengths = [len(t) for t in token_ids]
-        max_length = max(length)
-        padded = [t + [PAD_ID] * (max_length - len(t)) for t in token_ids]
+        max_length = max(lengths)
+        padded = [t + [pad_id] * (max_length - len(t)) for t in token_ids]
         input_ids = torch.tensor(padded, dtype = torch.int).to(DEVICE)
 
         with torch.no_grad():
@@ -66,7 +68,6 @@ def extract_embeddings(
 
 if __name__ == "__main__":
     seqs = np.load('output/NPC1_mut_seq.npy')
-    model = Evo2("evo2_7b")
     embeddings = extract_embeddings(seqs, model, LAYER_NAME, BATCH_SIZE)
     np.save("embeddings.npy", embeddings)
 
