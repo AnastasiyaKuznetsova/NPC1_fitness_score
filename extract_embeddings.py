@@ -5,7 +5,7 @@ from evo2 import Evo2
 MODEL_ID = "arcinstitute/evo2_7b" 
 LAYER_NAME = 'blocks.28.mlp.l3'
 PAD_ID = 0
-BATCH_SIZE = 8
+BATCH_SIZE = 1
 DEVICE = ("cuda" if torch.cuda.is_available()
           else "mps" if torch.backends.mps.is_available()
           else "cpu" 
