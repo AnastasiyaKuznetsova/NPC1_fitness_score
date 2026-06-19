@@ -65,7 +65,7 @@ def extract_embeddings(
       return np.concatenate(all_embeddings, axis = 0)
 
 if __name__ == "__main__":
-    seqs = np.load('NPC1_mut_seq.npy')
+    seqs = np.load('output/NPC1_mut_seq.npy')
     embeddings = extract_embeddings(seqs, MODEL_ID, LAYER_NAME, BATCH_SIZE)
     np.save("embeddings.npy", embeddings)
 
