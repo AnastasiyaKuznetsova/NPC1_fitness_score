@@ -52,7 +52,7 @@ def extract_embeddings(
                                             layer_names = [layer])
             
             hidden = embeddings[layer] # B, L, D
-            mask = torch.zeros(hidden.shape[0], hidden.shape[1], type = torch.bool, device = DEVICE)
+            mask = torch.zeros((hidden.shape[0], hidden.shape[1]), dtype = torch.bool, device = DEVICE)
             
             for i,l in enumerate(lengths):
                 mask[i,:l] = True
