@@ -71,7 +71,7 @@ def extract_embeddings(
                     pooled = pooled/mask_expanded.sum()
             else:
                 pooled = hidden
-            all_embeddings.append(pooled.cpu().numpy())
+            all_embeddings.append(pooled.float().cpu().numpy())
             print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
 
       return np.concatenate(all_embeddings, axis = 0)
