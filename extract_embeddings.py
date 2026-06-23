@@ -77,7 +77,7 @@ def extract_embeddings(
             print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
             if not os.path.exists("embeddings"):
                  os.makedirs("embeddings")
-            np.save("embeddings/{df}_emb_DNA_avg_{AVERAGE}_{i}.npy", pooled.float().cpu().numpy())
+            np.save(f"embeddings/{df}_emb_DNA_avg_{AVERAGE}_{i}.npy", pooled.float().cpu().numpy())
 
 if __name__ == "__main__":
     for df in ['ref_seq', 'mut_seq']:
