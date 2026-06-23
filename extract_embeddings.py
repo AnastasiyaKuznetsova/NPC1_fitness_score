@@ -45,7 +45,7 @@ def extract_embeddings(
         batch_size: sequences per forward pass
         average: if average embeddings across sequence length
     """
-      all_embeddings = []
+
       for i,start in enumerate(range(0, len(sequences), batch_size)):
         seqs = sequences[start:start + batch_size]
         token_ids = [model.tokenizer.tokenize(seq) for seq in seqs]
@@ -64,8 +64,8 @@ def extract_embeddings(
             if average:
                     mask = torch.zeros((hidden.shape[0], hidden.shape[1]), dtype = torch.bool, device = DEVICE)
                     
-                    for i,l in enumerate(lengths):
-                        mask[i,:l] = True
+                    for b,l in enumerate(lengths):
+                        mask[b,:l] = True
                     
                     # Average across sequence length - will remove it later!
                     mask_expanded = mask.unsqueeze(-1).float() # B, L, 1
