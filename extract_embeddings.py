@@ -27,11 +27,13 @@ print("Model loaded.\n")
 def extract_embeddings(
         sequences: list[str],
     model,
+    df: str,
     layer: str = LAYER_NAME,
     batch_size: int = BATCH_SIZE,
     pad_id: int = PAD_ID,
     average: bool = AVERAGE
-) -> np.ndarray:
+    
+) -> np.ndarray: # type: ignore
 
 
       """
@@ -44,7 +46,7 @@ def extract_embeddings(
         average: if average embeddings across sequence length
     """
       all_embeddings = []
-      for start in range(0, len(sequences), batch_size):
+      for i,start in enumerate(range(0, len(sequences), batch_size)):
         seqs = sequences[start:start + batch_size]
         token_ids = [model.tokenizer.tokenize(seq) for seq in seqs]
         lengths = [len(t) for t in token_ids]
@@ -71,16 +73,15 @@ def extract_embeddings(
                     pooled = pooled/mask_expanded.sum()
             else:
                 pooled = hidden
-            all_embeddings.append(pooled.float().cpu().numpy())
+            pooled.float().cpu().numpy()
             print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
-
-      return np.concatenate(all_embeddings, axis = 0)
+            np.save("{df}_emb_DNA_avg_{AVERAGE}_{i}.npy", pooled.float().cpu().numpy())
 
 if __name__ == "__main__":
     for df in ['ref_seq', 'mut_seq']:
         seqs = np.load(f"output/{df}_DNA.npy")
-        embeddings = extract_embeddings(seqs, model, LAYER_NAME, BATCH_SIZE, AVERAGE)
-        np.save("{df}_emb_DNA_avg_{AVERAGE}.npy", embeddings)
+        extract_embeddings(seqs, model, df, LAYER_NAME, BATCH_SIZE, AVERAGE)
+        
 
                 
 
