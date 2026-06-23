@@ -74,6 +74,8 @@ def extract_embeddings(
       return np.concatenate(all_embeddings, axis = 0)
 
 if __name__ == "__main__":
+    import os
+    os.environ["NVTE_FP8"] = "0"
     for df in ['ref_seq', 'mut_seq']:
         seqs = np.load(f"output/{df}_DNA.npy")
         embeddings = extract_embeddings(seqs, model, LAYER_NAME, BATCH_SIZE, AVERAGE)
