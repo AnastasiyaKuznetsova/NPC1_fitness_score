@@ -74,9 +74,10 @@ def extract_embeddings(
       return np.concatenate(all_embeddings, axis = 0)
 
 if __name__ == "__main__":
-    seqs = np.load(f"output/NPC1_dna_seq_avg_{AVERAGE}.npy")
-    embeddings = extract_embeddings(seqs, model, LAYER_NAME, BATCH_SIZE, AVERAGE)
-    np.save("embeddings.npy", embeddings)
+    for df in ['ref_seq', 'mut_seq']:
+        seqs = np.load(f"output/{df}_DNA.npy")
+        embeddings = extract_embeddings(seqs, model, LAYER_NAME, BATCH_SIZE, AVERAGE)
+        np.save("{df}_emb_DNA_avg_{AVERAGE}.npy", embeddings)
 
                 
 
