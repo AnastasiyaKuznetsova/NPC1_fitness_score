@@ -39,10 +39,6 @@ def parse_args() -> argparse.Namespace:
         "--last", action="store_true",
         help="Extract the last (non-padding) token hidden state instead of averaging",
     )
-    parser.add_argument(
-        "--cls", action="store_true",
-        help="Extract the CLS (first) token hidden state instead of averaging",
-    )
     return parser.parse_args()
 
 
@@ -52,7 +48,6 @@ def extract_embeddings(
     df: str,
     average: bool,
     last: bool,
-    cls: bool,
     layer: str = DEFAULT_LAYER_NAME,
     batch_size: int = BATCH_SIZE,
     pad_id: int = PAD_ID,
@@ -63,8 +58,7 @@ def extract_embeddings(
     Pooling modes (mutually exclusive, checked by caller):
         average=True  -> mean over non-padding tokens, shape (N, D)
         last=True     -> last non-padding token,       shape (N, D)
-        cls=True      -> first (CLS) token,            shape (N, D)
-        all False     -> full token sequence,           shape per-batch (B, L, D), saved per batch
+        both False    -> full token sequence,           shape per-batch (B, L, D), saved per batch
     """
     os.makedirs("embeddings", exist_ok=True)
     all_pooled = []
@@ -90,14 +84,12 @@ def extract_embeddings(
             elif last:
                 last_indices = torch.tensor([l - 1 for l in lengths], device=DEVICE)
                 pooled = hidden[torch.arange(hidden.shape[0], device=DEVICE), last_indices]  # B, D
-            elif cls:
-                pooled = hidden[:, 0, :]  # B, D
             else:
                 pooled = hidden
 
         print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
 
-        if not average and not last and not cls:
+        if not average and not last:
             np.save(f"embeddings/{df}_emb_DNA_seq_{i}.npy", pooled.float().cpu().numpy())
         else:
             all_pooled.append(pooled.float().cpu().numpy())
@@ -115,13 +107,12 @@ if __name__ == "__main__":
     model = Evo2(args.model)
     print("Model loaded.\n")
 
-    modes = [not args.average, args.last, args.cls]
-    if sum(modes) > 1:
-        raise ValueError("--no-average, --last, and --cls are mutually exclusive")
+    if not args.average and args.last:
+        raise ValueError("--last and --no-average are mutually exclusive")
 
     for df in ["ref_seq", "mut_seq"]:
         seqs = np.load(f"output/{df}_DNA.npy")
-        extract_embeddings(sequences=seqs, model=model, df=df, layer=args.layer, batch_size=args.batch_size, average=args.average, last=args.last, cls=args.cls)
+        extract_embeddings(sequences=seqs, model=model, df=df, layer=args.layer, batch_size=args.batch_size, average=args.average, last=args.last)
         
 
                 
