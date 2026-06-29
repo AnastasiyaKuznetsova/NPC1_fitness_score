@@ -14,7 +14,7 @@ DEVICE = (
     else "mps" if torch.backends.mps.is_available()
     else "cpu"
 )
-AVERAGE = True
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,10 +42,11 @@ def extract_embeddings(
     sequences: list[str],
     model,
     df: str,
+    average: bool,
     layer: str = DEFAULT_LAYER_NAME,
     batch_size: int = BATCH_SIZE,
-    pad_id: int = PAD_ID,
-    average: bool = AVERAGE,
+    pad_id: int = PAD_ID
+    
 ) -> np.ndarray:  # type: ignore
     """
     Returns hidden-state embeddings, shape (N, hidden_dim) if average=True else (N, seq_len, hidden_dim).
@@ -90,7 +91,7 @@ if __name__ == "__main__":
 
     for df in ["ref_seq", "mut_seq"]:
         seqs = np.load(f"output/{df}_DNA.npy")
-        extract_embeddings(seqs, model, df, args.layer, args.batch_size, args.average)
+        extract_embeddings(sequences=seqs, model=model, df=df, layer=args.layer, batch_size=args.batch_size, average=args.average)
         
 
                 
