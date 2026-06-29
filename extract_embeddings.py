@@ -35,6 +35,14 @@ def parse_args() -> argparse.Namespace:
         "--no-average", dest="average", action="store_false",
         help="Return per-token embeddings instead of sequence-averaged embeddings",
     )
+    parser.add_argument(
+        "--last", action="store_true",
+        help="Extract the last (non-padding) token hidden state instead of averaging",
+    )
+    parser.add_argument(
+        "--cls", action="store_true",
+        help="Extract the CLS (first) token hidden state instead of averaging",
+    )
     return parser.parse_args()
 
 
@@ -43,20 +51,24 @@ def extract_embeddings(
     model,
     df: str,
     average: bool,
+    last: bool,
+    cls: bool,
     layer: str = DEFAULT_LAYER_NAME,
     batch_size: int = BATCH_SIZE,
-    pad_id: int = PAD_ID
-    
+    pad_id: int = PAD_ID,
 ) -> np.ndarray:  # type: ignore
     """
-    Returns hidden-state embeddings, shape (N, hidden_dim) if average=True else (N, seq_len, hidden_dim).
+    Returns hidden-state embeddings per sequence.
 
-    Args:
-        sequences:  list of DNA strings (A/T/C/G, upper-case recommended)
-        layer:      hidden layer name to pool
-        batch_size: sequences per forward pass
-        average:    if True, average embeddings across sequence length
+    Pooling modes (mutually exclusive, checked by caller):
+        average=True  -> mean over non-padding tokens, shape (N, D)
+        last=True     -> last non-padding token,       shape (N, D)
+        cls=True      -> first (CLS) token,            shape (N, D)
+        all False     -> full token sequence,           shape per-batch (B, L, D), saved per batch
     """
+    os.makedirs("embeddings", exist_ok=True)
+    all_pooled = []
+
     for i, start in enumerate(range(0, len(sequences), batch_size)):
         seqs = sequences[start:start + batch_size]
         token_ids = [model.tokenizer.tokenize(seq) for seq in seqs]
@@ -75,12 +87,26 @@ def extract_embeddings(
                     mask[b, :l] = True
                 mask_expanded = mask.unsqueeze(-1).float()  # B, L, 1
                 pooled = (hidden * mask_expanded).sum(1) / mask_expanded.sum(1)
+            elif last:
+                last_indices = torch.tensor([l - 1 for l in lengths], device=DEVICE)
+                pooled = hidden[torch.arange(hidden.shape[0], device=DEVICE), last_indices]  # B, D
+            elif cls:
+                pooled = hidden[:, 0, :]  # B, D
             else:
                 pooled = hidden
 
         print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
-        os.makedirs("embeddings", exist_ok=True)
-        np.save(f"embeddings/{df}_emb_DNA_avg_{average}_{i}.npy", pooled.float().cpu().numpy())
+
+        if not average and not last and not cls:
+            np.save(f"embeddings/{df}_emb_DNA_seq_{i}.npy", pooled.float().cpu().numpy())
+        else:
+            all_pooled.append(pooled.float().cpu().numpy())
+
+    if all_pooled:
+        mode = "avg" if average else "last" if last else "cls"
+        combined = np.concatenate(all_pooled, axis=0)
+        np.save(f"embeddings/{df}_emb_DNA_{mode}.npy", combined)
+        print(f"Saved {mode} embeddings: {combined.shape}")
 
 if __name__ == "__main__":
     args = parse_args()
@@ -89,9 +115,13 @@ if __name__ == "__main__":
     model = Evo2(args.model)
     print("Model loaded.\n")
 
+    modes = [not args.average, args.last, args.cls]
+    if sum(modes) > 1:
+        raise ValueError("--no-average, --last, and --cls are mutually exclusive")
+
     for df in ["ref_seq", "mut_seq"]:
         seqs = np.load(f"output/{df}_DNA.npy")
-        extract_embeddings(sequences=seqs, model=model, df=df, layer=args.layer, batch_size=args.batch_size, average=args.average)
+        extract_embeddings(sequences=seqs, model=model, df=df, layer=args.layer, batch_size=args.batch_size, average=args.average, last=args.last, cls=args.cls)
         
 
                 
