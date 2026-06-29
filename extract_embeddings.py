@@ -1,5 +1,4 @@
 import os
-os.environ["NVTE_FP8"] = "0"
 
 import torch
 import numpy as np
@@ -67,7 +66,6 @@ def extract_embeddings(
                     for b,l in enumerate(lengths):
                         mask[b,:l] = True
                     
-                    # Average across sequence length - will remove it later!
                     mask_expanded = mask.unsqueeze(-1).float() # B, L, 1
                     pooled = (hidden * mask_expanded).sum(1)
                     pooled = pooled/mask_expanded.sum()
