@@ -20,9 +20,7 @@ DEVICE = (
 MODEL_CONFIG = {
     "evo2_1b_base":  {"num_layers": 25, "params": "1B"},
     "evo2_7b":       {"num_layers": 32, "params": "7B"},
-    "evo2_7b_base":  {"num_layers": 32, "params": "7B"},
-    "evo2_40b":      {"num_layers": 50, "params": "40B"},
-    "evo2_40b_base": {"num_layers": 50, "params": "40B"},
+    "evo2_40b":      {"num_layers": 50, "params": "40B"}
 }
 
 
@@ -37,10 +35,10 @@ def layer_index(layer: str) -> str:
     m = re.search(r"blocks\.(\d+)\.", layer)
     return m.group(1) if m else layer
 
-
-def build_filename(seq_type: str, model_name: str, params: str, layer: str, mode: str) -> str:
+# mut/ref, model, params billions/millions, mode mean/last
+def build_filename(seq_type: str, model_name: str, params: str, layer: str, mode: str, strand: str) -> str:
     """Build output filename: {seq_type}_Evo2_{params}_L{n_layer}_{mode}.npy"""
-    return f"{seq_type}_Evo2_{params}_L{layer_index(layer)}_{mode}.npy"
+    return f"{seq_type}_Evo2_{params}_L{layer_index(layer)}_{mode}_{strand}.npy"
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +78,7 @@ def extract_embeddings(
     last: bool,
     layer: str,
     seq_type: str,
+    strand: str, 
     params: str,
     batch_size: int = BATCH_SIZE,
     pad_id: int = PAD_ID,
@@ -120,15 +119,15 @@ def extract_embeddings(
 
         print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
 
-        if not average and not last:
-            fname = build_filename(seq_type, "Evo2", params, layer, f"{mode}_{i}")
-            np.save(f"embeddings/{df}_{fname}", pooled.float().cpu().numpy())
+        if mode == "seq":
+            fname = build_filename(seq_type, "Evo2", params, layer, mode, strand) 
+            np.save(f"embeddings/{df}_{fname}_{i}", pooled.float().cpu().numpy())
         else:
             all_pooled.append(pooled.float().cpu().numpy())
 
     if all_pooled:
         combined = np.concatenate(all_pooled, axis=0)
-        fname = build_filename(seq_type, "Evo2", params, layer, mode)
+        fname = build_filename(seq_type, "Evo2", params, layer, mode, strand)
         np.save(f"embeddings/{df}_{fname}", combined)
         print(f"Saved {mode} embeddings: {combined.shape} -> {fname}")
 
@@ -164,4 +163,5 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             average=args.average,
             last=args.last,
+            strand=args.strand
         )
