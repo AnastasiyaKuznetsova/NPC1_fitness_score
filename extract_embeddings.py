@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 
 import torch
 import numpy as np
@@ -15,17 +16,46 @@ DEVICE = (
     else "cpu"
 )
 
+# num_layers and human-readable parameter count per model variant
+MODEL_CONFIG = {
+    "evo2_1b_base":  {"num_layers": 25, "params": "1B"},
+    "evo2_7b":       {"num_layers": 32, "params": "7B"},
+    "evo2_7b_base":  {"num_layers": 32, "params": "7B"},
+    "evo2_40b":      {"num_layers": 50, "params": "40B"},
+    "evo2_40b_base": {"num_layers": 50, "params": "40B"},
+}
+
+
+def last_layer_name(layer: str, num_layers: int) -> str:
+    """Replace the block index in a layer name with the last block index."""
+    last_idx = num_layers - 1
+    return re.sub(r"(blocks\.)(\d+)(\.)", rf"\g<1>{last_idx}\3", layer, count=1)
+
+
+def layer_index(layer: str) -> str:
+    """Extract block index from a layer name like 'blocks.28.mlp.l3' -> '28'."""
+    m = re.search(r"blocks\.(\d+)\.", layer)
+    return m.group(1) if m else layer
+
+
+def build_filename(seq_type: str, model_name: str, params: str, layer: str, mode: str) -> str:
+    """Build output filename: {seq_type}_Evo2_{params}_L{n_layer}_{mode}.npy"""
+    return f"{seq_type}_Evo2_{params}_L{layer_index(layer)}_{mode}.npy"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract Evo2 embeddings from DNA sequences.")
+    parser = argparse.ArgumentParser(description="Extract Evo2 embeddings from DNA/RNA sequences.")
     parser.add_argument(
         "--model", default=DEFAULT_MODEL_ID,
         help=f"Evo2 model variant to load (default: {DEFAULT_MODEL_ID})",
     )
     parser.add_argument(
         "--layer", default=DEFAULT_LAYER_NAME,
-        help=f"Layer name to extract hidden states from (default: {DEFAULT_LAYER_NAME})",
+        help=f"Layer name to extract hidden states from (default: {DEFAULT_LAYER_NAME}); ignored when --last is set",
+    )
+    parser.add_argument(
+        "--seq-type", default="DNA", choices=["DNA", "RNA"],
+        help="Sequence type label used in output filename (default: DNA)",
     )
     parser.add_argument(
         "--batch-size", type=int, default=BATCH_SIZE,
@@ -37,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--last", action="store_true",
-        help="Extract the last (non-padding) token hidden state instead of averaging",
+        help="Extract the last (non-padding) token hidden state from the last layer",
     )
     return parser.parse_args()
 
@@ -48,20 +78,21 @@ def extract_embeddings(
     df: str,
     average: bool,
     last: bool,
-    layer: str = DEFAULT_LAYER_NAME,
+    layer: str,
+    seq_type: str,
+    params: str,
     batch_size: int = BATCH_SIZE,
     pad_id: int = PAD_ID,
 ) -> np.ndarray:  # type: ignore
     """
-    Returns hidden-state embeddings per sequence.
-
     Pooling modes (mutually exclusive, checked by caller):
         average=True  -> mean over non-padding tokens, shape (N, D)
-        last=True     -> last non-padding token,       shape (N, D)
-        both False    -> full token sequence,           shape per-batch (B, L, D), saved per batch
+        last=True     -> last non-padding token from last layer, shape (N, D)
+        both False    -> full token sequences, saved per batch
     """
     os.makedirs("embeddings", exist_ok=True)
     all_pooled = []
+    mode = "mean" if average else "last" if last else "seq"
 
     for i, start in enumerate(range(0, len(sequences), batch_size)):
         seqs = sequences[start:start + batch_size]
@@ -90,35 +121,47 @@ def extract_embeddings(
         print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
 
         if not average and not last:
-            np.save(f"embeddings/{df}_emb_DNA_seq_{i}.npy", pooled.float().cpu().numpy())
+            fname = build_filename(seq_type, "Evo2", params, layer, f"{mode}_{i}")
+            np.save(f"embeddings/{df}_{fname}", pooled.float().cpu().numpy())
         else:
             all_pooled.append(pooled.float().cpu().numpy())
 
     if all_pooled:
-        mode = "avg" if average else "last" if last else "cls"
         combined = np.concatenate(all_pooled, axis=0)
-        np.save(f"embeddings/{df}_emb_DNA_{mode}.npy", combined)
-        print(f"Saved {mode} embeddings: {combined.shape}")
+        fname = build_filename(seq_type, "Evo2", params, layer, mode)
+        np.save(f"embeddings/{df}_{fname}", combined)
+        print(f"Saved {mode} embeddings: {combined.shape} -> {fname}")
+
 
 if __name__ == "__main__":
     args = parse_args()
+
+    if not args.average and args.last:
+        raise ValueError("--last and --no-average are mutually exclusive")
+
+    cfg = MODEL_CONFIG.get(args.model)
+    if cfg is None:
+        raise ValueError(f"Unknown model {args.model!r}. Add it to MODEL_CONFIG or check the name.")
+
+    # --last always uses the final layer regardless of --layer
+    layer = last_layer_name(args.layer, cfg["num_layers"]) if args.last else args.layer
+    if args.last:
+        print(f"[last-token mode] using last layer: {layer}")
 
     print(f"Loading {args.model} ...")
     model = Evo2(args.model)
     print("Model loaded.\n")
 
-    if not args.average and args.last:
-        raise ValueError("--last and --no-average are mutually exclusive")
-
     for df in ["ref_seq", "mut_seq"]:
         seqs = np.load(f"output/{df}_DNA.npy")
-        extract_embeddings(sequences=seqs, model=model, df=df, layer=args.layer, batch_size=args.batch_size, average=args.average, last=args.last)
-        
-
-                
-
-                
-
-
-                  
-            
+        extract_embeddings(
+            sequences=seqs,
+            model=model,
+            df=df,
+            layer=layer,
+            seq_type=args.seq_type,
+            params=cfg["params"],
+            batch_size=args.batch_size,
+            average=args.average,
+            last=args.last,
+        )
