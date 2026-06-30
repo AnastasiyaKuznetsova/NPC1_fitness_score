@@ -152,7 +152,7 @@ if __name__ == "__main__":
     print("Model loaded.\n")
 
     for df in ["ref_seq", "mut_seq"]:
-        seqs = np.load(f"output/{df}_DNA.npy")
+        seqs = np.load(f"output/{df}_DNA_{args.strand}.npy")
         extract_embeddings(
             sequences=seqs,
             model=model,
@@ -160,8 +160,8 @@ if __name__ == "__main__":
             layer=layer,
             seq_type=args.seq_type,
             params=cfg["params"],
+            strand=args.strand,
             batch_size=args.batch_size,
             average=args.average,
             last=args.last,
-            strand=args.strand
         )
