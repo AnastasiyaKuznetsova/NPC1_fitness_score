@@ -103,7 +103,7 @@ def extract_embeddings(
             hidden = embeddings[layer]  # B, L, D
 
             if emb_type == "average":
-                mask = torch.zeros((hidden.shape[0], hidden.shape[1]), dtype=torch.bool, device=DEVICE)
+                mask = torch.zeros((hidden.shape[0], hidden.shape[1]), dtype=torch.bool, device=hidden.device)
                 for b, l in enumerate(lengths):
                     mask[b, :l] = True
                 mask_expanded = mask.unsqueeze(-1).float()  # B, L, 1
