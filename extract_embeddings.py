@@ -109,8 +109,8 @@ def extract_embeddings(
                 mask_expanded = mask.unsqueeze(-1).float()  # B, L, 1
                 pooled = (hidden * mask_expanded).sum(1) / mask_expanded.sum(1)
             else:  # last
-                last_indices = torch.tensor([l - 1 for l in lengths], device=DEVICE)
-                pooled = hidden[torch.arange(hidden.shape[0], device=DEVICE), last_indices]  # B, D
+                last_indices = torch.tensor([l - 1 for l in lengths], device=hidden.device)
+                pooled = hidden[torch.arange(hidden.shape[0], device=hidden.device), last_indices]  # B, D
 
         all_pooled.append(pooled.float().cpu().numpy())
         print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
