@@ -6,6 +6,9 @@ import torch
 import numpy as np
 from evo2 import Evo2
 
+from transformer_engine.common.recipe import _OverrideLinearPrecision, DelayedScaling, Format # type: ignore[attr-defined]
+torch.serialization.add_safe_globals([_OverrideLinearPrecision, DelayedScaling, Format])
+
 DEFAULT_MODEL_ID = "evo2_7b"
 DEFAULT_LAYER_NAME = "blocks.28.mlp.l3"
 PAD_ID = 0
@@ -22,6 +25,7 @@ MODEL_CONFIG = {
     "evo2_7b":      {"num_layers": 32, "params": "7B"},
     "evo2_40b":     {"num_layers": 50, "params": "40B"},
 }
+
 
 
 def last_layer_name(layer: str, num_layers: int) -> str:
