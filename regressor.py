@@ -186,15 +186,14 @@ def build_pipeline(linear: bool = False, use_ridge: bool = True) -> Pipeline:
     Ridge is recommended when features are collinear or n_features > n_samples.
     """
     if not linear:
-        model = lgb.LGBMRegressor(verbose=-1)   # silence LightGBM split warnings
+        model = lgb.LGBMRegressor(verbose=-1)
         logging.info("Using LGBM Regressor")
+        return Pipeline([("reg", model)])
     else:
         model = Ridge() if use_ridge else LinearRegression()
         logging.info("Using linear model")
-    return Pipeline([
-        ("scaler", StandardScaler()),
-        ("reg",    model),
-    ])
+        return Pipeline([("scaler", StandardScaler()), ("reg", model)])
+  
 
 
 # ── 4. Evaluate ───────────────────────────────────────────────────────────────
