@@ -1,4 +1,6 @@
 /data
 *.pem
 /evo2
-
+/*logs*
+/*B*
+.vscode/
