@@ -19,7 +19,6 @@ DEVICE = (
     else "cpu"
 )
 
-# num_layers and human-readable parameter count per model variant
 MODEL_CONFIG = {
     "evo2_1b_base": {"num_layers": 25, "params": "1B"},
     "evo2_7b":      {"num_layers": 32, "params": "7B"},
@@ -28,49 +27,44 @@ MODEL_CONFIG = {
 
 
 
-def last_layer_name(layer: str, num_layers: int) -> str:
-    """Replace the block index in a layer name with the last block index."""
-    last_idx = num_layers - 1
-    return re.sub(r"(blocks\.)(\d+)(\.)", rf"\g<1>{last_idx}\3", layer, count=1)
-
-
 def layer_index(layer: str) -> str:
-    """Extract block index from a layer name like 'blocks.28.mlp.l3' -> '28'."""
     m = re.search(r"blocks\.(\d+)\.", layer)
     return m.group(1) if m else layer
 
 
 def build_filename(seq_type: str, params: str, layer: str, mode: str, strand: str) -> str:
-    """Build output filename: {seq_type}_Evo2_{params}_L{n_layer}_{mode}_{strand}.npy"""
     return f"{seq_type}_Evo2_{params}_L{layer_index(layer)}_{mode}_{strand}.npy"
+
+
+def pool(hidden: torch.Tensor, lengths: list[int], emb_type: str) -> torch.Tensor:
+    """Apply pooling to a (B, L, D) hidden state tensor."""
+    if emb_type == "average":
+        mask = torch.zeros((hidden.shape[0], hidden.shape[1]), dtype=torch.bool, device=hidden.device)
+        for b, l in enumerate(lengths):
+            mask[b, :l] = True
+        mask_expanded = mask.unsqueeze(-1).float()
+        return (hidden * mask_expanded).sum(1) / mask_expanded.sum(1)
+    else:  # last
+        last_indices = torch.tensor([l - 1 for l in lengths], device=hidden.device)
+        return hidden[torch.arange(hidden.shape[0], device=hidden.device), last_indices]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract Evo2 embeddings from DNA/RNA sequences.")
-    parser.add_argument(
-        "--model", default=DEFAULT_MODEL_ID,
-        help=f"Evo2 model variant to load (default: {DEFAULT_MODEL_ID})",
-    )
-    parser.add_argument(
-        "--layer", default=DEFAULT_LAYER_NAME,
-        help=f"Layer name to extract hidden states from (default: {DEFAULT_LAYER_NAME}); ignored when --emb-type last",
-    )
-    parser.add_argument(
-        "--seq-type", default="DNA", choices=["DNA", "RNA"],
-        help="Sequence type label used in output filename (default: DNA)",
-    )
-    parser.add_argument(
-        "--strand", default="forward", choices=["forward", "reverse"],
-        help="Strand direction — selects input file and labels output (default: forward)",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=BATCH_SIZE,
-        help=f"Sequences per forward pass (default: {BATCH_SIZE})",
-    )
-    parser.add_argument(
-        "--emb-type", default="average", choices=["average", "last"],
-        help="Pooling strategy: 'average' = mean over non-padding tokens; 'last' = last token from last layer (default: average)",
-    )
+    parser.add_argument("--model", default=DEFAULT_MODEL_ID,
+                        help=f"Evo2 model variant (default: {DEFAULT_MODEL_ID})")
+    parser.add_argument("--layer", nargs="+", default=[DEFAULT_LAYER_NAME],
+                        help="One or more layer names to extract. All layers are extracted in a "
+                             f"single forward pass. (default: {DEFAULT_LAYER_NAME})")
+    parser.add_argument("--seq-type", default="DNA", choices=["DNA", "RNA"],
+                        help="Sequence type label in output filename (default: DNA)")
+    parser.add_argument("--strand", default="forward", choices=["forward", "reverse"],
+                        help="Strand direction — selects input file and labels output (default: forward)")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                        help=f"Sequences per forward pass (default: {BATCH_SIZE})")
+    parser.add_argument("--emb-type", default="average", choices=["average", "last"],
+                        help="Pooling: 'average' = mean over non-padding tokens; "
+                             "'last' = last token from last layer (default: average)")
     return parser.parse_args()
 
 
@@ -79,7 +73,7 @@ def extract_embeddings(
     model,
     df: str,
     emb_type: str,
-    layer: str,
+    layers: list[str],
     seq_type: str,
     strand: str,
     params: str,
@@ -87,14 +81,13 @@ def extract_embeddings(
     pad_id: int = PAD_ID,
 ) -> None:
     """
-    Pooling modes (emb_type):
-        'average' -> mean over non-padding tokens, shape (N, D)
-        'last'    -> last non-padding token from last layer, shape (N, D)
+    Extract embeddings from one or more layers in a single forward pass per batch.
+    Saves one .npy file per layer.
     """
     os.makedirs("embeddings", exist_ok=True)
-    all_pooled = []
+    all_pooled = {layer: [] for layer in layers}
 
-    for i, start in enumerate(range(0, len(sequences), batch_size)):
+    for start in range(0, len(sequences), batch_size):
         seqs = sequences[start:start + batch_size]
         token_ids = [model.tokenizer.tokenize(seq) for seq in seqs]
         lengths = [len(t) for t in token_ids]
@@ -103,26 +96,19 @@ def extract_embeddings(
         input_ids = torch.tensor(padded, dtype=torch.int).to(DEVICE)
 
         with torch.no_grad():
-            _, embeddings = model.forward(input_ids, return_embeddings=True, layer_names=[layer])
-            hidden = embeddings[layer]  # B, L, D
+            _, embeddings = model.forward(input_ids, return_embeddings=True, layer_names=layers)
+            for layer in layers:
+                hidden = embeddings[layer]  # B, L, D
+                pooled = pool(hidden, lengths, emb_type)
+                all_pooled[layer].append(pooled.float().cpu().numpy())
 
-            if emb_type == "average":
-                mask = torch.zeros((hidden.shape[0], hidden.shape[1]), dtype=torch.bool, device=hidden.device)
-                for b, l in enumerate(lengths):
-                    mask[b, :l] = True
-                mask_expanded = mask.unsqueeze(-1).float()  # B, L, 1
-                pooled = (hidden * mask_expanded).sum(1) / mask_expanded.sum(1)
-            else:  # last
-                last_indices = torch.tensor([l - 1 for l in lengths], device=hidden.device)
-                pooled = hidden[torch.arange(hidden.shape[0], device=hidden.device), last_indices]  # B, D
-
-        all_pooled.append(pooled.float().cpu().numpy())
         print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
 
-    combined = np.concatenate(all_pooled, axis=0)
-    fname = build_filename(seq_type, params, layer, emb_type, strand)
-    np.save(f"embeddings/{df}_{fname}", combined)
-    print(f"Saved {emb_type} embeddings: {combined.shape} -> {df}_{fname}")
+    for layer in layers:
+        combined = np.concatenate(all_pooled[layer], axis=0)
+        fname = build_filename(seq_type, params, layer, emb_type, strand)
+        np.save(f"embeddings/{df}_{fname}", combined)
+        print(f"Saved {emb_type} embeddings layer {layer_index(layer)}: {combined.shape} -> {df}_{fname}")
 
 
 if __name__ == "__main__":
@@ -132,10 +118,7 @@ if __name__ == "__main__":
     if cfg is None:
         raise ValueError(f"Unknown model {args.model!r}. Add it to MODEL_CONFIG or check the name.")
 
-    # last-token mode always uses the final layer
-    layer = last_layer_name(args.layer, cfg["num_layers"]) if args.emb_type == "last" else args.layer
-    if args.emb_type == "last":
-        print(f"[last-token mode] using last layer: {layer}")
+    layers = args.layer
 
     print(f"Loading {args.model} ...")
     model = Evo2(args.model)
@@ -148,7 +131,7 @@ if __name__ == "__main__":
             model=model,
             df=df,
             emb_type=args.emb_type,
-            layer=layer,
+            layers=layers,
             seq_type=args.seq_type,
             params=cfg["params"],
             strand=args.strand,
