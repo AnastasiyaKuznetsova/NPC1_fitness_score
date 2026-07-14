@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--emb-type", default="average", choices=["average", "last"],
                         help="Pooling: 'average' = mean over non-padding tokens; "
                              "'last' = last token from last layer (default: average)")
+    parser.add_argument("--ref-file", default=None, metavar="FILE",
+                        help="Path to reference sequences .npy file. "
+                             "Default: output/ref_seq_DNA_{strand}.npy")
+    parser.add_argument("--mut-file", default=None, metavar="FILE",
+                        help="Path to mutant sequences .npy file. "
+                             "Default: output/mut_seq_DNA_{strand}.npy")
     return parser.parse_args()
 
 
@@ -124,8 +130,13 @@ if __name__ == "__main__":
     model = Evo2(args.model)
     print("Model loaded.\n")
 
-    for df in ["ref_seq", "mut_seq"]:
-        seqs = np.load(f"output/{df}_DNA_{args.strand}.npy")
+    input_files = {
+        "ref_seq": args.ref_file or f"output/ref_seq_DNA_{args.strand}.npy",
+        "mut_seq": args.mut_file or f"output/mut_seq_DNA_{args.strand}.npy",
+    }
+
+    for df, path in input_files.items():
+        seqs = np.load(path)
         extract_embeddings(
             sequences=seqs,
             model=model,
