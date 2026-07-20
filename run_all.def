@@ -1,0 +1,40 @@
+Bootstrap: docker
+From: python:3.12-slim
+
+%post
+    set -e
+    apt-get update
+    apt-get install -y --no-install-recommends libgomp1
+    rm -rf /var/lib/apt/lists/*
+
+    pip install --no-cache-dir \
+        numpy==2.4.6 \
+        pandas==3.0.3 \
+        scipy==1.18.0 \
+        scikit-learn==1.9.0 \
+        joblib==1.5.3 \
+        lightgbm==4.6.0
+
+%environment
+    export LC_ALL=C.UTF-8
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec python3 "$@"
+
+%labels
+    Author akuznetsova@scripps.edu
+
+%help
+    Environment image for run_all.py / regressor.py (nested-CV regressor sweep
+    over DNA/RNA embeddings). Provides numpy, pandas, scipy, scikit-learn,
+    joblib, and lightgbm — no project code or data is baked into the image,
+    so bind-mount the project directory at runtime.
+
+    Build:
+        apptainer build run_all.sif run_all.def
+
+    Run (from the Genomic_model directory, so run_all.py/regressor.py and
+    your embedding/output dirs are visible inside the container):
+        apptainer run --bind "$PWD":"$PWD" --pwd "$PWD" run_all.sif \
+            run_all.py --emb emb_7B/emb_7B --model_dir saved_models
