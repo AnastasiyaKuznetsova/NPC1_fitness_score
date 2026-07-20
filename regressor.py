@@ -12,6 +12,17 @@ Embedding modes:
   --emb_mode rna          : single .npy file of RNA embeddings (original behaviour)
   --emb_mode dna --delta  : delta embeddings (mut - ref)
   --emb_mode dna          : concat embeddings (mut || ref)
+
+ The val_r works because predictions vary slightly across inner folds (each fold predicts a different mean). 
+ For train/test with dummy, predictions are constant → NaN. The user just wants the raw computed value — remove the NaN→0 
+ fallback entirely:
+
+Now it returns whatever Spearman computes — NaN for constant predictions (dummy train/test), a real number otherwise. 
+The NaN will show up in the summary and CSV as nan, which is the honest result. 
+
+python3 regressor.py --emb_mode dna --emb emb_1B --strand forward --delta \
+    --pca 50 --models Ridge --model_dir saved_models/
+
 """
 
 import argparse
@@ -19,14 +30,57 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
+import joblib
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import GroupShuffleSplit, GroupKFold
-from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.model_selection import GroupKFold, GridSearchCV
+from sklearn.metrics import make_scorer
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.dummy import DummyRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.decomposition import PCA
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.svm import SVR
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, Matern, RationalQuadratic, DotProduct
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from scipy.stats import spearmanr
 from sklearn.pipeline import Pipeline
 import lightgbm as lgb
+
+MODELS = [
+    # "LightGBM",  # disabled — overfits on high-dimensional embeddings
+    "Ridge", "Lasso", "ElasticNet",
+    "KernelRidge", "SVR", "PLS", "GaussianProcess", "kNN",
+    "RandomForest", "DecisionTree", "Dummy",
+]
+
+GP_KERNELS = [
+    RBF() + WhiteKernel(),
+    Matern(nu=1.5) + WhiteKernel(),
+    Matern(nu=2.5) + WhiteKernel(),
+    RationalQuadratic() + WhiteKernel(),
+    DotProduct() + WhiteKernel(),
+]
+
+PARAM_GRIDS = {
+    "Ridge":        {"reg__alpha": [0.01, 0.1, 1, 10, 100, 1000, 10000]},
+    "Lasso":        {"reg__alpha": [0.0001, 0.001, 0.01, 0.1, 1.0]},
+    "ElasticNet":   {"reg__alpha": [0.001, 0.01, 0.1], "reg__l1_ratio": [0.2, 0.5, 0.8]},
+    "KernelRidge":  {"reg__alpha": [0.01, 0.1, 1, 10], "reg__gamma": [None, 0.001, 0.01, 0.1]},
+    "SVR":          {"reg__C": [0.1, 1, 10, 100], "reg__gamma": ["scale", "auto"]},
+    "PLS":          {"reg__n_components": [5, 10, 20, 30, 50]},
+    "GaussianProcess": {"reg__kernel": GP_KERNELS},  # per-kernel length-scale etc. still optimised internally
+    "kNN":          {"reg__n_neighbors": [3, 5, 10, 20, 50]},
+    "RandomForest": {"reg__max_depth": [3, 5, 7], "reg__min_samples_leaf": [5, 10, 20]},
+    "DecisionTree": {"reg__max_depth": [3, 5, 7], "reg__min_samples_leaf": [5, 10, 20]},
+    "LightGBM":     {},
+    "Dummy":        {},
+}
 
 
 # ── 0. Logging ────────────────────────────────────────────────────────────────
@@ -68,189 +122,377 @@ def load_data_rna(path_to_df: str, path_to_emb: str) -> tuple[pd.DataFrame, np.n
     return df, emb
 
 
-def load_data_dna(
-    path_to_df: str,
-    path_ref: str,
-    path_mut: str,
-    delta: bool,
-) -> tuple[pd.DataFrame, np.ndarray]:
-    """
-    DNA path: separate reference and mutant embedding matrices.
+def _load_ref_mut(emb_dir, strand: str, layer: str = None, pooling: str = None) -> tuple[np.ndarray, np.ndarray]:
+    """Load refs_*{strand}*.npy and muts_*{strand}*.npy from a directory, squeeze to (N, D)."""
+    if not hasattr(emb_dir, "glob"):
+        emb_dir = Path(emb_dir)
 
-    Returns (df, emb) where emb is either:
-      delta  = mut - ref        (N, D)   when delta=True
-      concat = [mut || ref]     (N, 2D)  when delta=False
-    """
-    sep = "\t" if path_to_df.endswith(".tsv") else ","
-    df  = pd.read_csv(path_to_df, sep=sep)
+    if layer is not None and pooling is not None:
+        ref_files = sorted(emb_dir.rglob(f"ref_seq_*L{layer}*{pooling}*{strand}*.npy"))
+        mut_files = sorted(emb_dir.rglob(f"mut_seq_*L{layer}*{pooling}*{strand}*.npy"))
+    else:
+        ref_files = sorted(emb_dir.glob(f"ref_seq_*{strand}*.npy"))
+        mut_files = sorted(emb_dir.glob(f"mut_seq_*{strand}*.npy"))
 
-    ref = np.load(path_ref)  # (N, D) or (N, 1, D) from Evo2
-    mut = np.load(path_mut)  # (N, D) or (N, 1, D) from Evo2
+    # Fall back to any ref/mut file if no strand-specific files found
+    # (older directories where strand is indicated by folder name, not filename)
+    if not ref_files:
+        ref_files = sorted(emb_dir.glob("ref_seq_*.npy"))
+    if not mut_files:
+        mut_files = sorted(emb_dir.glob("mut_seq_*.npy"))
 
-    # Evo2 saves embeddings with an extra length dim → squeeze to (N, D)
+    if not ref_files:
+        raise FileNotFoundError(f"No ref_seq_*.npy files found in {str(emb_dir)}")
+    if not mut_files:
+        raise FileNotFoundError(f"No mut_seq_*.npy files found in {str(emb_dir)}")
+    if len(ref_files) != 1 or len(mut_files) != 1:
+        raise ValueError(
+            f"Expected exactly one refs and one muts file for strand '{strand}', "
+            f"found refs: {ref_files} and muts: {mut_files}"
+        )
+
+    logging.info(f"  ref: {ref_files[0]}")
+    logging.info(f"  mut: {mut_files[0]}")
+
+    ref = np.load(ref_files[0])
+    mut = np.load(mut_files[0])
+
     if ref.ndim == 3:
         ref = ref.squeeze(1)
     if mut.ndim == 3:
         mut = mut.squeeze(1)
 
     assert ref.shape == mut.shape, (
-        f"Reference and mutant embedding shapes must match: "
-        f"{ref.shape} vs {mut.shape}"
+        f"ref/mut shape mismatch: {ref.shape} vs {mut.shape}"
     )
+    return ref, mut
 
-    logging.info(f"Loaded {ref.shape[0]} variants | embedding dim {ref.shape[1]}")
 
+def _pool(ref: np.ndarray, mut: np.ndarray, delta: bool) -> np.ndarray:
+    """Apply delta or concat pooling to a ref/mut pair."""
     if delta:
-        emb = mut - ref
-        logging.info(f"  delta  shape : {emb.shape}")
+        return mut - ref
+    return np.concatenate([mut, ref], axis=1)
+
+
+def load_data_dna(
+    path_to_df: str,
+    emb: str,
+    delta: bool,
+    use_reverse: bool = False,
+    strand: str = "forward",
+    layer: str = None,
+    pooling: str = None,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    DNA path: loads strand embeddings from emb directory.
+      strand='forward'  → forward only
+      strand='reverse'  → reverse only
+      use_reverse=True  → forward + reverse concatenated
+    """
+    sep = "\t" if path_to_df.endswith(".tsv") else ","
+    df  = pd.read_csv(path_to_df, sep=sep)
+
+    if use_reverse:
+        logging.info("Loading forward-strand embeddings:")
+        ref_fwd, mut_fwd = _load_ref_mut(emb, "forward", layer=layer, pooling=pooling)
+        emb_fwd = _pool(ref_fwd, mut_fwd, delta)
+        logging.info(f"  forward pool shape: {emb_fwd.shape}")
+        logging.info("Loading reverse-strand embeddings:")
+        ref_rev, mut_rev = _load_ref_mut(emb, "reverse", layer=layer, pooling=pooling)
+        emb_rev = _pool(ref_rev, mut_rev, delta)
+        logging.info(f"  reverse pool shape: {emb_rev.shape}")
+        emb_out = np.concatenate([emb_fwd, emb_rev], axis=1)
+        logging.info(f"  combined shape: {emb_out.shape}")
     else:
-        emb = np.concatenate([mut, ref], axis=1)
-        logging.info(f"  concat shape : {emb.shape}")
+        logging.info(f"Loading {strand}-strand embeddings:")
+        ref, mut = _load_ref_mut(emb, strand, layer=layer, pooling=pooling)
+        emb_out = _pool(ref, mut, delta)
+        logging.info(f"  {strand} pool shape: {emb_out.shape}")
 
-    return df, emb
-
-
-# ── 2. Group-aware split ──────────────────────────────────────────────────────
-
-def group_train_test_split(
-    emb: np.ndarray,
-    y: np.ndarray,
-    groups: np.ndarray,
-    test_size: float = 0.2,
-    random_state: int = 42,
-) -> tuple:
-    """
-    Single hold-out split that keeps all members of a cluster_id
-    entirely in train or entirely in test.
-
-    Returns: X_train, X_test, y_train, y_test, train_idx, test_idx
-    """
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size,
-                            random_state=random_state)
-    y = np.asarray(y)
-    train_idx, test_idx = next(gss.split(emb, y, groups=groups))
-
-    train_clusters = set(groups[train_idx])
-    test_clusters  = set(groups[test_idx])
-    overlap = train_clusters & test_clusters
-    assert len(overlap) == 0, f"Cluster leakage detected: {overlap}"
-
-    logging.info(f"Train: {len(train_idx)} samples | {len(train_clusters)} clusters")
-    logging.info(f"Test : {len(test_idx)}  samples | {len(test_clusters)}  clusters")
-
-    return (emb[train_idx], emb[test_idx],
-            y[train_idx],   y[test_idx],
-            train_idx,      test_idx)
+    logging.info(f"Loaded {emb_out.shape[0]} variants | final dim {emb_out.shape[1]}")
+    return df, emb_out
 
 
-def group_kfold_cv(
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman correlation. .statistic added in scipy 1.9; falls back to .correlation."""
+    result = spearmanr(a, b)
+    corr = getattr(result, "statistic", None)
+    if corr is None:
+        corr = getattr(result, "correlation", float("nan"))
+    return float(corr)
+
+
+_spearman_scorer = make_scorer(_safe_corr)
+
+
+# ── 2. Cross-validation ───────────────────────────────────────────────────────
+
+def simple_cv(
     X: np.ndarray,
     y: np.ndarray,
     groups: np.ndarray,
-    n_splits: int = 5,
-    linear: bool = False,
+    model_name: str,
+    pca_components: int = None,
+) -> tuple[list[dict], object]:
+    """2-fold group cross-validation (no inner loop) for when only 2 groups exist."""
+    cv = GroupKFold(n_splits=2)
+    fold_metrics = []
+    best_model = None
+    best_test_corr = -np.inf
+
+    for fold, (tr, te) in enumerate(cv.split(X, y, groups=groups), 1):
+        pipe = build_pipeline(model_name=model_name, pca_components=pca_components)
+        pipe.fit(X[tr], y[tr])
+
+        y_train_pred = pipe.predict(X[tr])
+        y_test_pred  = pipe.predict(X[te])
+
+        train_corr = _safe_corr(y[tr], y_train_pred)
+        test_corr  = _safe_corr(y[te], y_test_pred)
+        test_mse   = mean_squared_error(y[te], y_test_pred)
+        test_mae   = mean_absolute_error(y[te], y_test_pred)
+        train_mse  = mean_squared_error(y[tr], y_train_pred)
+        train_mae  = mean_absolute_error(y[tr], y_train_pred)
+
+        logging.info(
+            f"Fold {fold}/2 | train r={train_corr:.3f} | "
+            f"test r={test_corr:.3f} MSE={test_mse:.4f} MAE={test_mae:.4f}"
+        )
+
+        if not np.isnan(test_corr) and test_corr > best_test_corr:
+            best_test_corr = test_corr
+            best_model = pipe
+
+        fold_metrics.append({
+            "outer_fold": fold,
+            "train_corr": float(train_corr), "train_mse": float(train_mse), "train_mae": float(train_mae),
+            "val_corr": float("nan"),         "val_mse":   float("nan"),     "val_mae":   float("nan"),
+            "test_corr": float(test_corr),   "test_mse":  float(test_mse),  "test_mae":  float(test_mae),
+        })
+
+    logging.info(f"2-fold CV mean test corr: {np.mean([m['test_corr'] for m in fold_metrics]):.3f}")
+    return fold_metrics, best_model
+
+
+def nested_cv(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    model_name: str,
+    outer_splits: int = 5,
+    inner_splits: int = 3,
+    pca_components: int = None,
 ) -> list[dict]:
     """
-    Group K-Fold cross-validation — no cluster appears in both
-    the fold's train and validation sets.
+    Nested group K-Fold cross-validation.
 
-    Returns list of per-fold metric dicts.
+    Outer loop (outer_splits folds): unbiased performance estimate —
+      each outer test fold is never seen during inner loop or model fit.
+    Inner loop (inner_splits folds): validation on the outer train split —
+      reports inner CV metrics alongside the outer test metrics.
+
+    Returns list of per-outer-fold dicts with both inner CV and outer test metrics.
     """
-    gkf = GroupKFold(n_splits=n_splits)
+    outer_cv = GroupKFold(n_splits=outer_splits)
+    inner_cv = GroupKFold(n_splits=inner_splits)
+    param_grid = PARAM_GRIDS.get(model_name, {})
+    gs_scoring = {
+        "spearman": _spearman_scorer,
+        "neg_mse":  "neg_mean_squared_error",
+        "neg_mae":  "neg_mean_absolute_error",
+    }
     fold_metrics = []
+    best_model = None
+    best_test_corr = -np.inf
 
-    for fold, (tr, val) in enumerate(gkf.split(X, y, groups=groups)):
-        pipe = build_pipeline(linear=linear)
-        pipe.fit(X[tr], y[tr])
-        y_pred = pipe.predict(X[val])
-        metrics = {
-            "fold": fold + 1,
-            "r2":   r2_score(y[val], y_pred),
-            "rmse": np.sqrt(mean_squared_error(y[val], y_pred)),
-            "mae":  mean_absolute_error(y[val], y_pred),
-        }
-        fold_metrics.append(metrics)
-        logging.info(f"Fold {fold+1}: R²={metrics['r2']:.3f}  "
-                     f"RMSE={metrics['rmse']:.4f}  MAE={metrics['mae']:.4f}")
+    for outer_fold, (outer_tr, outer_te) in enumerate(outer_cv.split(X, y, groups=groups), 1):
+        X_outer_tr, X_outer_te = X[outer_tr], X[outer_te]
+        y_outer_tr, y_outer_te = y[outer_tr], y[outer_te]
+        g_outer_tr = groups[outer_tr]
 
-    logging.info(f"Mean CV R²  : {np.mean([m['r2']   for m in fold_metrics]):.3f}")
-    logging.info(f"Mean CV RMSE: {np.mean([m['rmse'] for m in fold_metrics]):.4f}")
-    return fold_metrics
+        # ── Inner loop: hyperparameter tuning via GridSearchCV ────────────────
+        pipe = build_pipeline(model_name=model_name, pca_components=pca_components)
+        if param_grid:
+            gs = GridSearchCV(
+                pipe, param_grid,
+                cv=inner_cv,
+                scoring=gs_scoring,
+                refit="spearman",
+                n_jobs=-1,
+            )
+            gs.fit(X_outer_tr, y_outer_tr, groups=g_outer_tr)
+            best_pipe = gs.best_estimator_
+            best_idx  = gs.best_index_
+            val_corr  = float(gs.cv_results_["mean_test_spearman"][best_idx])
+            val_mse   = float(-gs.cv_results_["mean_test_neg_mse"][best_idx])
+            val_mae   = float(-gs.cv_results_["mean_test_neg_mae"][best_idx])
+            logging.info(f"  Best params: {gs.best_params_}")
+        else:
+            # No grid to search — fit once and get val metrics via manual inner CV
+            val_y_true, val_y_pred = [], []
+            for inner_tr, inner_val in inner_cv.split(X_outer_tr, y_outer_tr, groups=g_outer_tr):
+                p = build_pipeline(model_name=model_name, pca_components=pca_components)
+                p.fit(X_outer_tr[inner_tr], y_outer_tr[inner_tr])
+                val_y_true.append(y_outer_tr[inner_val])
+                val_y_pred.append(p.predict(X_outer_tr[inner_val]))
+            val_y_true = np.concatenate(val_y_true)
+            val_y_pred = np.concatenate(val_y_pred)
+            val_mse  = mean_squared_error(val_y_true, val_y_pred)
+            val_mae  = mean_absolute_error(val_y_true, val_y_pred)
+            val_corr = _safe_corr(val_y_true, val_y_pred)
+            pipe.fit(X_outer_tr, y_outer_tr)
+            best_pipe = pipe
+
+        # ── Outer test ────────────────────────────────────────────────────────
+
+        y_train_pred = best_pipe.predict(X_outer_tr)
+        y_outer_pred = best_pipe.predict(X_outer_te)
+
+        train_mse  = mean_squared_error(y_outer_tr, y_train_pred)
+        train_mae  = mean_absolute_error(y_outer_tr, y_train_pred)
+        train_corr = _safe_corr(y_outer_tr, y_train_pred)
+
+        test_mse  = mean_squared_error(y_outer_te, y_outer_pred)
+        test_mae  = mean_absolute_error(y_outer_te, y_outer_pred)
+        test_corr = _safe_corr(y_outer_te, y_outer_pred)
+
+        best_params_str = f" | best={gs.best_params_}" if param_grid else ""
+        logging.info(
+            f"Outer fold {outer_fold}/{outer_splits} | "
+            f"train r={train_corr:.3f} | "
+            f"val r={val_corr:.3f} MSE={val_mse:.4f} | "
+            f"test r={test_corr:.3f} MSE={test_mse:.4f} MAE={test_mae:.4f}"
+            f"{best_params_str}"
+        )
+
+        if not np.isnan(test_corr) and test_corr > best_test_corr:
+            best_test_corr = test_corr
+            best_model = best_pipe
+
+        fold_metrics.append({
+            "outer_fold": outer_fold,
+            "train_corr": float(train_corr),
+            "train_mse":  float(train_mse),
+            "train_mae":  float(train_mae),
+            "val_corr":   float(val_corr),
+            "val_mse":    float(val_mse),
+            "val_mae":    float(val_mae),
+            "test_corr":  float(test_corr),
+            "test_mse":   float(test_mse),
+            "test_mae":   float(test_mae),
+        })
+
+    logging.info(f"Nested CV mean test corr: {np.mean([m['test_corr'] for m in fold_metrics]):.3f}")
+    logging.info(f"Nested CV mean test MSE : {np.mean([m['test_mse']  for m in fold_metrics]):.4f}")
+    logging.info(f"Nested CV mean test MAE : {np.mean([m['test_mae']  for m in fold_metrics]):.4f}")
+    return fold_metrics, best_model
 
 
 # ── 3. Model ──────────────────────────────────────────────────────────────────
 
-def build_pipeline(linear: bool = False, use_ridge: bool = True) -> Pipeline:
-    """
-    StandardScaler → Ridge / LinearRegression / LGBMRegressor pipeline.
-    Ridge is recommended when features are collinear or n_features > n_samples.
-    """
-    if not linear:
-        model = lgb.LGBMRegressor(verbose=-1)
-        logging.info("Using LGBM Regressor")
-        return Pipeline([("reg", model)])
-    else:
-        model = Ridge() if use_ridge else LinearRegression()
-        logging.info("Using linear model")
-        return Pipeline([("scaler", StandardScaler()), ("reg", model)])
+def build_pipeline(model_name: str, pca_components: int = None) -> Pipeline:
+    """Build a StandardScaler [+ PCA] + model pipeline."""
+    if model_name not in MODELS:
+        raise ValueError(f"Unknown model '{model_name}'. Choose from: {MODELS}")
+
+    if model_name == "Dummy":
+        logging.info("Using Dummy Regressor (mean baseline)")
+        return Pipeline([("reg", DummyRegressor(strategy="mean"))])
+
+    # PLS has built-in dimensionality reduction — skip external PCA
+    use_pca = bool(pca_components) and model_name != "PLS"
+    pca_step = [("pca", PCA(n_components=pca_components, random_state=42))] if use_pca else []
+    pca_label = f"PCA({pca_components}) + " if use_pca else ""
+
+    regressors = {
+        "LightGBM": lgb.LGBMRegressor(
+            verbose=-1, n_estimators=200, learning_rate=0.05,
+            num_leaves=15, max_depth=3, min_child_samples=20,
+            subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=1.0,
+        ),
+        "Ridge":       Ridge(alpha=100.0),
+        "Lasso":       Lasso(alpha=0.01, max_iter=5000),
+        "ElasticNet":  ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
+        "KernelRidge": KernelRidge(kernel="rbf", alpha=1.0),
+        "SVR":         SVR(kernel="rbf", C=1.0),
+        "PLS":         PLSRegression(n_components=min(pca_components or 20, 20)),
+        "GaussianProcess": GaussianProcessRegressor(
+            kernel=RBF() + WhiteKernel(), random_state=42, normalize_y=True,
+        ),
+        "kNN":          KNeighborsRegressor(n_neighbors=5, weights="distance"),
+        "RandomForest": RandomForestRegressor(
+            n_estimators=200, max_depth=5, min_samples_leaf=10,
+            max_features="sqrt", random_state=42, n_jobs=-1,
+        ),
+        "DecisionTree": DecisionTreeRegressor(
+            max_depth=5, min_samples_leaf=10, random_state=42,
+        ),
+    }
+
+    logging.info(f"Using {pca_label}{model_name}")
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        *pca_step,
+        ("reg", regressors[model_name]),
+    ])
   
 
 
 # ── 4. Evaluate ───────────────────────────────────────────────────────────────
-
-def evaluate(
-    pipe: Pipeline,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-    tag: str = "",
-) -> dict:
-    y_pred = pipe.predict(X_test)
-
-    r2   = r2_score(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    mae  = mean_absolute_error(y_test, y_pred)
-    corr = np.corrcoef(y_test, y_pred)[0, 1]
-
-    label = f" [{tag}]" if tag else ""
-    logging.info(f"── Hold-out test metrics{label} " + "─" * max(0, 40 - len(label)))
-    logging.info(f"R²       : {r2:.4f}")
-    logging.info(f"RMSE     : {rmse:.4f}")
-    logging.info(f"MAE      : {mae:.4f}")
-    logging.info(f"Pearson r: {corr:.4f}")
-
-    return {"tag": tag, "r2": r2, "rmse": rmse, "mae": mae, "pearson_r": corr}
-
 
 # ── 5. Run one embedding matrix end-to-end ────────────────────────────────────
 
 def run_single(
     emb: np.ndarray,
     df: pd.DataFrame,
-    linear: bool,
+    model_name: str,
     tag: str = "",
+    outer_splits: int = 5,
+    inner_splits: int = 3,
+    pca_components: int = None,
+    model_dir: Path = None,
+    fold_by: str = "Protein Annotation",
 ) -> dict:
-    """Full pipeline for one embedding matrix. Returns hold-out metrics dict."""
+    """Full pipeline for one embedding matrix using nested CV. Returns mean ± std metrics."""
     logging.info("=" * 60)
     logging.info(f"  {tag}")
     logging.info("=" * 60)
 
-    groups = df["Protein Annotation"].to_numpy()
+    if fold_by not in df.columns:
+        raise ValueError(f"--fold_by column '{fold_by}' not found in dataframe. "
+                         f"Available columns: {list(df.columns)}")
+    groups = df[fold_by].to_numpy()
     y      = df["Function Score"].to_numpy()
+    n_groups = len(np.unique(groups))
+    logging.info(f"Grouping by: '{fold_by}' ({n_groups} unique groups)")
 
-    logging.info("=== Hold-out split ===")
-    X_train, X_test, y_train, y_test, tr_idx, _ = group_train_test_split(
-        emb, y, groups, test_size=0.2
-    )
+    if n_groups == 2:
+        fold_metrics, best_model = simple_cv(emb, y, groups, model_name=model_name,
+                                             pca_components=pca_components)
+    else:
+        fold_metrics, best_model = nested_cv(emb, y, groups, model_name=model_name,
+                                             outer_splits=outer_splits, inner_splits=inner_splits,
+                                             pca_components=pca_components)
 
-    groups_train = groups[tr_idx]
+    if model_dir is not None and best_model is not None:
+        model_dir = Path(model_dir)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        safe_tag = tag.replace(" ", "_").replace("|", "").replace("/", "-")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_path = model_dir / f"{safe_tag}_{timestamp}.joblib"
+        joblib.dump(best_model, model_path)
+        logging.info(f"Best model saved to: {model_path}")
 
-    logging.info("=== Group K-Fold CV ===")
-    group_kfold_cv(X_train, y_train, groups_train, n_splits=3, linear=linear)
-
-    pipe = build_pipeline(linear=linear)
-    pipe.fit(X_train, y_train)
-    metrics = evaluate(pipe, X_test, y_test, tag=tag)
-    return metrics
+    result = {"tag": tag}
+    for metric in ("train_corr", "train_mse", "train_mae",
+                   "val_corr",   "val_mse",   "val_mae",
+                   "test_corr",  "test_mse",  "test_mae"):
+        vals = [m[metric] for m in fold_metrics]
+        result[metric]          = float(np.mean(vals))
+        result[f"{metric}_std"] = float(np.std(vals, ddof=1))
+    return result
 
 
 # ── 6. Main ───────────────────────────────────────────────────────────────────
@@ -266,30 +508,43 @@ def main(args):
     if args.emb_mode == "rna":
         if not args.emb:
             raise ValueError("--emb is required for --emb_mode rna")
-
         df, emb = load_data_rna(args.df, args.emb)
-        m = run_single(emb, df, linear=args.linear, tag="RNA embeddings")
-        results.append(m)
-
     elif args.emb_mode == "dna":
-        if not args.emb_ref or not args.emb_mut:
-            raise ValueError(
-                "--emb_ref and --emb_mut are required for --emb_mode dna"
-            )
+        if not args.emb:
+            raise ValueError("--emb is required for --emb_mode dna")
+        use_reverse = args.strand == "both"
+        strand = "forward" if args.strand != "reverse" else "reverse"
+        regime = "delta" if args.delta else "concat"
+        df, emb = load_data_dna(args.df, args.emb, args.delta, use_reverse=use_reverse,
+                                 strand=strand, layer=args.layer, pooling=args.pooling)
+    else:
+        raise ValueError(f"Unknown emb_mode: {args.emb_mode}")
 
-        tag = "DNA | delta (mut - ref)" if args.delta else "DNA | concat (mut || ref)"
-        df, emb = load_data_dna(args.df, args.emb_ref, args.emb_mut, args.delta)
-        m = run_single(emb, df, linear=args.linear, tag=tag)
-        results.append(m)
+    regime_label = "delta" if args.delta else "concat"
+    for model_name in args.models:
+        tag = f"{model_name} | {regime_label} | {args.strand}"
+        results.append(run_single(emb, df, model_name=model_name,
+                                  tag=tag, pca_components=args.pca,
+                                  model_dir=args.model_dir, fold_by=args.fold_by))
+    results.append(run_single(emb, df, model_name="Dummy",
+                              tag="Dummy (mean baseline)", pca_components=None,
+                              model_dir=None, fold_by=args.fold_by))
 
     # ── Summary table ──────────────────────────────────────────────────────
     logging.info("\n" + "=" * 60)
     logging.info("  SUMMARY")
     logging.info("=" * 60)
-    logging.info(f"{'Tag':<35} {'R²':>6} {'RMSE':>7} {'Pearson r':>10}")
-    logging.info("-" * 60)
+    logging.info(f"{'Tag':<35} {'train_r':>8} {'stdev':>7} {'val_r':>7} {'stdev':>7} {'test_r':>7} {'stdev':>7} {'test_mse':>9} {'stdev':>7} {'test_mae':>9} {'stdev':>7}")
+    logging.info("-" * 115)
     for m in results:
-        logging.info(f"{m['tag']:<35} {m['r2']:>6.4f} {m['rmse']:>7.4f} {m['pearson_r']:>10.4f}")
+        logging.info(
+            f"{m['tag']:<35} "
+            f"{m['train_corr']:>8.4f} {m['train_corr_std']:>7.4f} "
+            f"{m['val_corr']:>7.4f} {m['val_corr_std']:>7.4f} "
+            f"{m['test_corr']:>7.4f} {m['test_corr_std']:>7.4f} "
+            f"{m['test_mse']:>9.4f} {m['test_mse_std']:>7.4f} "
+            f"{m['test_mae']:>9.4f} {m['test_mae_std']:>7.4f}"
+        )
 
     logging.info(f"\nFull log saved to: {log_path.resolve()}")
 
@@ -301,11 +556,11 @@ if __name__ == "__main__":
         description="Train regressor on RNA or DNA (delta/concat) embeddings."
     )
 
-    parser.add_argument("--df", required=True,
+    parser.add_argument("--df", default="output/df_preprocessed.csv",
                         help="Path to preprocessed CSV/TSV with Function Score "
                              "and Protein Annotation columns.")
 
-    parser.add_argument("--emb_mode", choices=["rna", "dna"], default="rna",
+    parser.add_argument("--emb_mode", choices=["rna", "dna"], default="dna",
                         help="Embedding mode: 'rna' (single .npy) or "
                              "'dna' (ref + mut .npy files). Default: rna")
 
@@ -313,20 +568,36 @@ if __name__ == "__main__":
     parser.add_argument("--emb",
                         help="[RNA mode] Path to RNA embedding .npy file.")
 
-    # DNA args
-    parser.add_argument("--emb_ref",
-                        help="[DNA mode] Path to reference embedding .npy file.")
-    parser.add_argument("--emb_mut",
-                        help="[DNA mode] Path to mutant embedding .npy file.")
+    parser.add_argument("--strand", choices=["forward", "reverse", "both"], default="forward",
+                        help="[DNA mode] Which strand(s) to use: 'forward', 'reverse', or "
+                             "'both' (forward + reverse concatenated). Default: forward.")
     parser.add_argument("--delta", action="store_true",
                         help="[DNA mode] Use delta (mut - ref) embeddings. "
                              "Default without this flag is concat (mut || ref).")
+    parser.add_argument("--layer", default=None,
+                        help="[DNA mode] Layer index to select (e.g. 27). Required when the "
+                             "embedding directory contains multiple layers.")
+    parser.add_argument("--pooling", choices=["average", "last"], default=None,
+                        help="[DNA mode] Pooling mode: 'average' or 'last'. Required when the "
+                             "embedding directory contains multiple pooling modes.")
+
+    parser.add_argument("--fold_by", choices=["Protein Annotation", "merged_region"],
+                        default="Protein Annotation",
+                        help="Column to use for group-aware fold splitting. "
+                             "'Protein Annotation' (default) or 'merged_region'.")
 
     # Model args
-    parser.add_argument("--linear", action="store_true",
-                        help="Use Ridge regression instead of LightGBM.")
+    parser.add_argument("--models", nargs="+", default=["Ridge"],
+                        choices=MODELS,
+                        help=f"Models to run (default: Ridge). Choices: {MODELS}")
 
     # Logging
+    parser.add_argument("--pca", type=int, default=None,
+                        help="Number of PCA components before regression. "
+                             "Omit to skip PCA (default: no PCA).")
+    parser.add_argument("--model_dir", default=None,
+                        help="Directory to save the best model per run as a .joblib file. "
+                             "Omit to skip saving.")
     parser.add_argument("--log_dir", default="logs",
                         help="Directory for log files. Default: logs/")
 
@@ -336,24 +607,31 @@ if __name__ == "__main__":
 
 # ── Usage examples ────────────────────────────────────────────────────────────
 #
-# RNA (original behaviour):
+# RNA, Ridge:
 #   python regressor.py \
 #       --df output/df_preprocessed.csv \
 #       --emb_mode rna \
 #       --emb output/rna_embeddings.npy \
 #       --linear
 #
-# DNA delta (mut - ref), LightGBM:
+# DNA delta, forward strand, Ridge + LightGBM, PCA(50):
 #   python regressor.py \
 #       --df output/df_preprocessed.csv \
 #       --emb_mode dna --delta \
-#       --emb_ref output/ref_embeddings.npy \
-#       --emb_mut output/mut_embeddings.npy
+#       --emb embeddings/ \
+#       --strand forward --pca 50 --models Ridge LightGBM
 #
-# DNA concat (mut || ref), Ridge:
+# DNA concat, reverse strand, ElasticNet + SVR, PCA(50):
 #   python regressor.py \
 #       --df output/df_preprocessed.csv \
 #       --emb_mode dna \
-#       --emb_ref output/ref_embeddings.npy \
-#       --emb_mut output/mut_embeddings.npy \
-#       --linear
+#       --emb embeddings/ \
+#       --strand reverse --pca 50 --models ElasticNet SVR
+#
+# DNA delta, forward + reverse, all models, PCA(50):
+#   python regressor.py \
+#       --df output/df_preprocessed.csv \
+#       --emb_mode dna --delta \
+#       --emb embeddings/ \
+#       --strand both --pca 50 \
+#       --models LightGBM Ridge Lasso ElasticNet KernelRidge SVR PLS GaussianProcess kNN
