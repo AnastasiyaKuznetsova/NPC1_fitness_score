@@ -50,10 +50,8 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from scipy.stats import spearmanr
 from sklearn.pipeline import Pipeline
-import lightgbm as lgb
 
 MODELS = [
-    # "LightGBM",  # disabled — overfits on high-dimensional embeddings
     "Ridge", "Lasso", "ElasticNet",
     "KernelRidge", "SVR", "PLS", "GaussianProcess", "kNN",
     "RandomForest", "DecisionTree", "Dummy",
@@ -83,7 +81,6 @@ PARAM_GRIDS = {
     "kNN":          {"reg__n_neighbors": [3, 5, 10, 20, 50]},
     "RandomForest": {"reg__max_depth": [3, 5, 7], "reg__min_samples_leaf": [5, 10, 20]},
     "DecisionTree": {"reg__max_depth": [3, 5, 7], "reg__min_samples_leaf": [5, 10, 20]},
-    "LightGBM":     {},
     "Dummy":        {},
 }
 
@@ -422,12 +419,6 @@ def build_pipeline(model_name: str, pca_components: int = None) -> Pipeline:
     pca_label = f"PCA({pca_components}) + " if use_pca else ""
 
     regressors = {
-        "LightGBM": lgb.LGBMRegressor(
-            verbose=-1, n_estimators=200, learning_rate=0.05,
-            num_leaves=15, max_depth=3, min_child_samples=20,
-            subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
-            reg_alpha=0.1, reg_lambda=1.0,
-        ),
         "Ridge":       Ridge(alpha=100.0),
         "Lasso":       Lasso(alpha=0.01, max_iter=5000),
         "ElasticNet":  ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
@@ -631,12 +622,12 @@ if __name__ == "__main__":
 #       --emb output/rna_embeddings.npy \
 #       --linear
 #
-# DNA delta, forward strand, Ridge + LightGBM, PCA(50):
+# DNA delta, forward strand, Ridge + SVR, PCA(50):
 #   python regressor.py \
 #       --df output/df_preprocessed.csv \
 #       --emb_mode dna --delta \
 #       --emb embeddings/ \
-#       --strand forward --pca 50 --models Ridge LightGBM
+#       --strand forward --pca 50 --models Ridge SVR
 #
 # DNA concat, reverse strand, ElasticNet + SVR, PCA(50):
 #   python regressor.py \
@@ -651,4 +642,4 @@ if __name__ == "__main__":
 #       --emb_mode dna --delta \
 #       --emb embeddings/ \
 #       --strand both --pca 50 \
-#       --models LightGBM Ridge Lasso ElasticNet KernelRidge SVR PLS GaussianProcess kNN
+#       --models Ridge Lasso ElasticNet KernelRidge SVR PLS GaussianProcess kNN

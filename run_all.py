@@ -1,7 +1,7 @@
 """
 Run all regressor combinations and save a single structured metrics CSV.
 
-Iterates over all layers found in --emb, both delta/concat, LightGBM/Ridge.
+Iterates over all layers found in --emb, both delta/concat, every regressor in MODELS.
 Output CSV columns:
   layer, model_arch, emb_type, strand, lightweight_model, hyperparams,
   train_corr, train_mse, train_mae,
@@ -41,7 +41,6 @@ def get_hyperparams(model_name: str, pca_components: int = None) -> str:
     reg = pipe.named_steps["reg"]
     params = reg.get_params()
     key_params = {
-        "LightGBM":       ["n_estimators", "max_depth", "num_leaves", "learning_rate"],
         "Ridge":          ["alpha"],
         "Lasso":          ["alpha"],
         "ElasticNet":     ["alpha", "l1_ratio"],
@@ -148,7 +147,7 @@ def main():
     emb_dir = Path(args.emb)
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    non_dummy_models = [m for m in MODELS if m not in ("Dummy", "LightGBM")]
+    non_dummy_models = [m for m in MODELS if m != "Dummy"]
     model_configs = [
         {"model_name": model_name, "delta": delta, "emb_type": "delta" if delta else "concat"}
         for model_name in non_dummy_models
