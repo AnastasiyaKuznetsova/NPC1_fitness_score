@@ -1,0 +1,136 @@
+Bootstrap: docker
+From: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+# =============================================================================
+# JanusDNA — Apptainer/Singularity container (no conda required)
+#
+# Reproduces the janusdna.yml environment using pip only:
+#   - Python 3.11, PyTorch 2.5.0 (cu121)
+#   - Prebuilt CUDA wheels for mamba_ssm, causal-conv1d, flash-attn
+#     (matching cu12 / torch2.5 / cp311 — no source compilation needed)
+#   - All remaining deps from requirements.txt
+#
+# BUILD (needs sudo/root or --fakeroot; requirements.txt must sit next
+#        to this .def file):
+#   apptainer build janusdna.sif janusdna.def
+#
+# RUN (host must have an NVIDIA driver; --nv exposes the GPU):
+#   apptainer run  --nv janusdna.sif                 # -> python
+#   apptainer exec --nv janusdna.sif python your_script.py
+#   apptainer shell --nv janusdna.sif                # interactive shell
+#
+# A single RTX A6000 (Ampere, 48 GB) is more than enough for inference /
+# embedding extraction. Multi-GPU is only needed for full pretraining.
+# =============================================================================
+
+%files
+    requirements.txt /opt/requirements.txt
+
+%post
+    set -eux
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ---- System packages -----------------------------------------------------
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        software-properties-common \
+        ca-certificates \
+        wget curl git \
+        build-essential \
+        zlib1g-dev libbz2-dev liblzma-dev \
+        libcurl4-openssl-dev libssl-dev \
+        tabix
+
+    # Python 3.11 (Ubuntu 22.04 ships 3.10 by default)
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev
+    rm -rf /var/lib/apt/lists/*
+
+    # ---- Isolated virtualenv --------------------------------------------------
+    python3.11 -m venv /opt/venv
+    . /opt/venv/bin/activate
+    python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+    # ---- PyTorch (CUDA 12.1) --------------------------------------------------
+    pip install --no-cache-dir \
+        torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 \
+        --index-url https://download.pytorch.org/whl/cu121
+
+    # ---- Prebuilt CUDA extension wheels --------------------------------------
+    # These match cu12 / torch2.5 / cxx11abiFALSE / cp311 — the exact ABI of
+    # the PyTorch pip wheels above, so no nvcc compilation is required.
+    MAMBA_WHL="https://github.com/state-spaces/mamba/releases/download/v2.2.4/mamba_ssm-2.2.4+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+    CONV1D_WHL="https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.0.post8/causal_conv1d-1.5.0.post8+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+    FLASH_WHL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+
+    pip install --no-cache-dir --no-deps "$CONV1D_WHL"
+    pip install --no-cache-dir --no-deps "$MAMBA_WHL"
+    pip install --no-cache-dir --no-deps "$FLASH_WHL"
+
+    # ---- Remaining Python dependencies ---------------------------------------
+    pip install --no-cache-dir -r /opt/requirements.txt
+
+    # selene-sdk is installed without deps, per the JanusDNA README
+    pip install --no-cache-dir selene-sdk --no-deps
+
+    # ---- JanusDNA source ------------------------------------------------------
+    git clone --depth 1 https://github.com/Qihao-Duan/JanusDNA.git /opt/JanusDNA
+
+    # Byte-compile check (non-fatal)
+    python -c "import torch; print('torch', torch.__version__)" || true
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PATH=/opt/venv/bin:$PATH
+    export VIRTUAL_ENV=/opt/venv
+    export PYTHONNOUSERSITE=1
+    export PYTHONPATH=/opt/JanusDNA:$PYTHONPATH
+    # Keep HF/torch caches inside the bound working dir by default
+    export HF_HOME=${HF_HOME:-$PWD/.hf_cache}
+
+%runscript
+    exec python "$@"
+
+%test
+    . /opt/venv/bin/activate
+    python - <<'PY'
+    import torch, mamba_ssm, causal_conv1d
+    print("torch:", torch.__version__, "| CUDA build:", torch.version.cuda)
+    try:
+        import flash_attn
+        print("flash_attn:", flash_attn.__version__)
+    except Exception as e:
+        print("flash_attn import note:", e)
+    print("mamba_ssm + causal_conv1d import OK")
+    print("CUDA available at test time:", torch.cuda.is_available())
+    PY
+
+%labels
+    Application JanusDNA
+    Description Bi-directional hybrid DNA foundation model (conda-free container)
+    Python 3.11
+    PyTorch 2.5.0+cu121
+    Source https://github.com/Qihao-Duan/JanusDNA
+
+%help
+    Conda-free Apptainer container for JanusDNA.
+
+    Build:
+        apptainer build janusdna.sif janusdna.def
+    Run:
+        apptainer run   --nv janusdna.sif                  # launches python
+        apptainer exec  --nv janusdna.sif python script.py
+        apptainer shell --nv janusdna.sif
+
+    Notes:
+      * Requires an NVIDIA GPU + driver on the host; pass --nv.
+      * A single RTX A6000 is sufficient for inference / embedding extraction.
+      * JanusDNA source is at /opt/JanusDNA (already on PYTHONPATH).
+      * Download pretrained weights from the Harvard Dataverse link in the
+        JanusDNA README and bind-mount them at runtime, e.g.:
+            apptainer exec --nv -B /path/to/weights:/weights janusdna.sif \
+                python /opt/JanusDNA/your_embedding_script.py
