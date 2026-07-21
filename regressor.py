@@ -59,12 +59,17 @@ MODELS = [
     "RandomForest", "DecisionTree", "Dummy",
 ]
 
+_GP_BOUNDS = (1e-7, 1e6)  # wider than sklearn's (1e-5, 1e5) default on every tunable
+                           # kernel hyperparameter, so the internal MLE optimizer has
+                           # room to move off the bound instead of raising ConvergenceWarning
+
 GP_KERNELS = [
-    RBF() + WhiteKernel(),
-    Matern(nu=1.5) + WhiteKernel(),
-    Matern(nu=2.5) + WhiteKernel(),
-    RationalQuadratic() + WhiteKernel(),
-    DotProduct() + WhiteKernel(),
+    RBF(length_scale_bounds=_GP_BOUNDS) + WhiteKernel(noise_level_bounds=_GP_BOUNDS),
+    Matern(nu=1.5, length_scale_bounds=_GP_BOUNDS) + WhiteKernel(noise_level_bounds=_GP_BOUNDS),
+    Matern(nu=2.5, length_scale_bounds=_GP_BOUNDS) + WhiteKernel(noise_level_bounds=_GP_BOUNDS),
+    RationalQuadratic(length_scale_bounds=_GP_BOUNDS, alpha_bounds=_GP_BOUNDS)
+        + WhiteKernel(noise_level_bounds=_GP_BOUNDS),
+    DotProduct(sigma_0_bounds=_GP_BOUNDS) + WhiteKernel(noise_level_bounds=_GP_BOUNDS),
 ]
 
 PARAM_GRIDS = {
@@ -226,6 +231,16 @@ def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
 _spearman_scorer = make_scorer(_safe_corr)
 
 
+def _best_params_repr(model_name: str, gs: GridSearchCV, best_pipe: Pipeline) -> dict:
+    """gs.best_params_ shows the *unfitted* grid value. For GaussianProcess that's just
+    the input kernel prototype (e.g. always alpha=1, length_scale=1) — the actual
+    hyperparameters are tuned internally by the GP's own MLE optimizer and only show up
+    on the fitted kernel_ attribute, so surface that instead for an honest log."""
+    if model_name == "GaussianProcess":
+        return {"reg__kernel": best_pipe.named_steps["reg"].kernel_}
+    return gs.best_params_
+
+
 # ── 2. Cross-validation ───────────────────────────────────────────────────────
 
 def simple_cv(
@@ -327,7 +342,8 @@ def nested_cv(
             val_corr  = float(gs.cv_results_["mean_test_spearman"][best_idx])
             val_mse   = float(-gs.cv_results_["mean_test_neg_mse"][best_idx])
             val_mae   = float(-gs.cv_results_["mean_test_neg_mae"][best_idx])
-            logging.info(f"  Best params: {gs.best_params_}")
+            best_params = _best_params_repr(model_name, gs, best_pipe)
+            logging.info(f"  Best params: {best_params}")
         else:
             # No grid to search — fit once and get val metrics via manual inner CV
             val_y_true, val_y_pred = [], []
@@ -357,7 +373,7 @@ def nested_cv(
         test_mae  = mean_absolute_error(y_outer_te, y_outer_pred)
         test_corr = _safe_corr(y_outer_te, y_outer_pred)
 
-        best_params_str = f" | best={gs.best_params_}" if param_grid else ""
+        best_params_str = f" | best={_best_params_repr(model_name, gs, best_pipe)}" if param_grid else ""
         logging.info(
             f"Outer fold {outer_fold}/{outer_splits} | "
             f"train r={train_corr:.3f} | "
@@ -419,7 +435,8 @@ def build_pipeline(model_name: str, pca_components: int = None) -> Pipeline:
         "SVR":         SVR(kernel="rbf", C=1.0),
         "PLS":         PLSRegression(n_components=min(pca_components or 20, 20)),
         "GaussianProcess": GaussianProcessRegressor(
-            kernel=RBF() + WhiteKernel(), random_state=42, normalize_y=True,
+            kernel=RBF(length_scale_bounds=_GP_BOUNDS) + WhiteKernel(noise_level_bounds=_GP_BOUNDS),
+            random_state=42, normalize_y=True, n_restarts_optimizer=5,
         ),
         "kNN":          KNeighborsRegressor(n_neighbors=5, weights="distance"),
         "RandomForest": RandomForestRegressor(
