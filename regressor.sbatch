@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Use this script to run each model on each node separately (n_arrays=0-10)
+# Across nodes: different models run simultaneously (SLURM array)
+# Within a node: inner CV folds run simultaneously (sklearn n_jobs=-1)
+
 #SBATCH --job-name=regressor
 #SBATCH --array=0-10
 #SBATCH --cpus-per-task=8
