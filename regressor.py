@@ -28,6 +28,7 @@ python3 regressor.py --emb_mode dna --emb emb_1B --strand forward --delta \
 import argparse
 import logging
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 import joblib
@@ -77,7 +78,9 @@ PARAM_GRIDS = {
     "KernelRidge":  {"reg__alpha": [0.01, 0.1, 1, 10], "reg__gamma": [None, 0.001, 0.01, 0.1]},
     "SVR":          {"reg__C": [0.1, 1, 10, 100], "reg__gamma": ["scale", "auto"]},
     "PLS":          {"reg__n_components": [5, 10, 20, 30, 50]},
-    "GaussianProcess": {"reg__kernel": GP_KERNELS},  # per-kernel length-scale etc. still optimised internally
+    "GaussianProcess":     {"reg__kernel": GP_KERNELS},
+    "GaussianProcess-pca": {"dr__n_components": [10, 20, 50, 100], "reg__kernel": GP_KERNELS},
+    "GaussianProcess-pls": {"dr__n_components": [5, 10, 20, 50],   "reg__kernel": GP_KERNELS},
     "kNN":          {"reg__n_neighbors": [3, 5, 10, 20, 50]},
     "RandomForest": {"reg__max_depth": [3, 5, 7], "reg__min_samples_leaf": [5, 10, 20]},
     "DecisionTree": {"reg__max_depth": [3, 5, 7], "reg__min_samples_leaf": [5, 10, 20]},
@@ -111,6 +114,13 @@ def setup_logging(log_dir: str = "logs") -> Path:
     root.addHandler(sh)
 
     logging.info(f"Log file: {log_path.resolve()}")
+
+    # Route Python warnings to the log file only (not stdout)
+    logging.captureWarnings(True)
+    warnings.simplefilter("always")
+    logging.getLogger("py.warnings").handlers = [fh]
+    logging.getLogger("py.warnings").propagate = False
+
     return log_path
 
 
@@ -228,14 +238,31 @@ def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
 _spearman_scorer = make_scorer(_safe_corr)
 
 
-def _best_params_repr(model_name: str, gs: GridSearchCV, best_pipe: Pipeline) -> dict:
-    """gs.best_params_ shows the *unfitted* grid value. For GaussianProcess that's just
-    the input kernel prototype (e.g. always alpha=1, length_scale=1) — the actual
-    hyperparameters are tuned internally by the GP's own MLE optimizer and only show up
-    on the fitted kernel_ attribute, so surface that instead for an honest log."""
+def _best_params_repr(model_name: str, gs: GridSearchCV, best_pipe: Pipeline, dr_mode: str = None) -> str:
+    """Build a readable string of the selected hyperparameters for logging.
+
+    For GaussianProcess variants:
+      - kernel family is selected by inner CV (from gs.best_params_)
+      - kernel hyperparameters (length_scale, noise) are optimised internally by MLE
+        and only visible on the fitted kernel_ attribute — so we log that, not the prototype
+      - DR component count (if PCA/PLS) comes from gs.best_params_
+    """
+    parts = []
+
     if model_name == "GaussianProcess":
-        return {"reg__kernel": best_pipe.named_steps["reg"].kernel_}
-    return gs.best_params_
+        gp = best_pipe.named_steps["reg"]
+        fitted_kernel = gp.kernel_
+        kernel_family = type(fitted_kernel.k1).__name__ if hasattr(fitted_kernel, "k1") else type(fitted_kernel).__name__
+
+        # DR component count (only present for pca/pls variants)
+        if dr_mode in ("pca", "pls") and "dr__n_components" in gs.best_params_:
+            parts.append(f"n_components={gs.best_params_['dr__n_components']}")
+
+        parts.append(f"kernel={kernel_family}")
+        parts.append(f"fitted_kernel={fitted_kernel}")
+        return " | ".join(parts)
+
+    return str(gs.best_params_)
 
 
 # ── 2. Cross-validation ───────────────────────────────────────────────────────
@@ -246,6 +273,7 @@ def simple_cv(
     groups: np.ndarray,
     model_name: str,
     pca_components: int = None,
+    dr_mode: str = None,
 ) -> tuple[list[dict], object]:
     """2-fold group cross-validation (no inner loop) for when only 2 groups exist."""
     cv = GroupKFold(n_splits=2)
@@ -254,7 +282,7 @@ def simple_cv(
     best_test_corr = -np.inf
 
     for fold, (tr, te) in enumerate(cv.split(X, y, groups=groups), 1):
-        pipe = build_pipeline(model_name=model_name, pca_components=pca_components)
+        pipe = build_pipeline(model_name=model_name, pca_components=pca_components, dr_mode=dr_mode)
         pipe.fit(X[tr], y[tr])
 
         y_train_pred = pipe.predict(X[tr])
@@ -295,6 +323,7 @@ def nested_cv(
     outer_splits: int = 5,
     inner_splits: int = 3,
     pca_components: int = None,
+    dr_mode: str = None,
 ) -> list[dict]:
     """
     Nested group K-Fold cross-validation.
@@ -308,7 +337,8 @@ def nested_cv(
     """
     outer_cv = GroupKFold(n_splits=outer_splits)
     inner_cv = GroupKFold(n_splits=inner_splits)
-    param_grid = PARAM_GRIDS.get(model_name, {})
+    param_grid_key = f"{model_name}-{dr_mode}" if dr_mode else model_name
+    param_grid = PARAM_GRIDS.get(param_grid_key, PARAM_GRIDS.get(model_name, {}))
     gs_scoring = {
         "spearman": _spearman_scorer,
         "neg_mse":  "neg_mean_squared_error",
@@ -324,7 +354,7 @@ def nested_cv(
         g_outer_tr = groups[outer_tr]
 
         # ── Inner loop: hyperparameter tuning via GridSearchCV ────────────────
-        pipe = build_pipeline(model_name=model_name, pca_components=pca_components)
+        pipe = build_pipeline(model_name=model_name, pca_components=pca_components, dr_mode=dr_mode)
         if param_grid:
             gs = GridSearchCV(
                 pipe, param_grid,
@@ -339,13 +369,13 @@ def nested_cv(
             val_corr  = float(gs.cv_results_["mean_test_spearman"][best_idx])
             val_mse   = float(-gs.cv_results_["mean_test_neg_mse"][best_idx])
             val_mae   = float(-gs.cv_results_["mean_test_neg_mae"][best_idx])
-            best_params = _best_params_repr(model_name, gs, best_pipe)
+            best_params = _best_params_repr(model_name, gs, best_pipe, dr_mode=dr_mode)
             logging.info(f"  Best params: {best_params}")
         else:
             # No grid to search — fit once and get val metrics via manual inner CV
             val_y_true, val_y_pred = [], []
             for inner_tr, inner_val in inner_cv.split(X_outer_tr, y_outer_tr, groups=g_outer_tr):
-                p = build_pipeline(model_name=model_name, pca_components=pca_components)
+                p = build_pipeline(model_name=model_name, pca_components=pca_components, dr_mode=dr_mode)
                 p.fit(X_outer_tr[inner_tr], y_outer_tr[inner_tr])
                 val_y_true.append(y_outer_tr[inner_val])
                 val_y_pred.append(p.predict(X_outer_tr[inner_val]))
@@ -370,7 +400,7 @@ def nested_cv(
         test_mae  = mean_absolute_error(y_outer_te, y_outer_pred)
         test_corr = _safe_corr(y_outer_te, y_outer_pred)
 
-        best_params_str = f" | best={_best_params_repr(model_name, gs, best_pipe)}" if param_grid else ""
+        best_params_str = f" | best={_best_params_repr(model_name, gs, best_pipe, dr_mode=dr_mode)}" if param_grid else ""
         logging.info(
             f"Outer fold {outer_fold}/{outer_splits} | "
             f"train r={train_corr:.3f} | "
@@ -404,8 +434,15 @@ def nested_cv(
 
 # ── 3. Model ──────────────────────────────────────────────────────────────────
 
-def build_pipeline(model_name: str, pca_components: int = None) -> Pipeline:
-    """Build a StandardScaler [+ PCA] + model pipeline."""
+def build_pipeline(model_name: str, pca_components: int = None, dr_mode: str = None) -> Pipeline:
+    """Build a StandardScaler [+ DR] + model pipeline.
+
+    dr_mode: None | 'pca' | 'pls'
+      - 'pca' : unsupervised PCA before the model
+      - 'pls' : supervised PLSRegression used as a transformer (fitted on X and y)
+      - None  : no dimensionality reduction
+    Only used when pca_components is set. For GaussianProcess, all three are run separately.
+    """
     if model_name not in MODELS:
         raise ValueError(f"Unknown model '{model_name}'. Choose from: {MODELS}")
 
@@ -413,10 +450,26 @@ def build_pipeline(model_name: str, pca_components: int = None) -> Pipeline:
         logging.info("Using Dummy Regressor (mean baseline)")
         return Pipeline([("reg", DummyRegressor(strategy="mean"))])
 
-    # PLS has built-in dimensionality reduction — skip external PCA
+    tree_based = model_name in ("RandomForest", "DecisionTree", "LightGBM")
+    scaler_step = [] if tree_based else [("scaler", StandardScaler())]
+
+    # Dimensionality reduction step
+    if pca_components and dr_mode == "pca" and model_name != "PLS":
+        dr_step = [("dr", PCA(n_components=pca_components, random_state=42))]
+        dr_label = f"PCA({pca_components}) + "
+    elif pca_components and dr_mode == "pls" and model_name != "PLS":
+        dr_step = [("dr", PLSRegression(n_components=min(pca_components, 20)))]
+        dr_label = f"PLS-DR({pca_components}) + "
+    elif pca_components and model_name != "PLS" and dr_mode is None:
+        # Legacy behaviour for non-GP models: --pca uses PCA by default
+        dr_step = [("dr", PCA(n_components=pca_components, random_state=42))]
+        dr_label = f"PCA({pca_components}) + "
+    else:
+        dr_step = []
+        dr_label = ""
+
     use_pca = bool(pca_components) and model_name != "PLS"
-    pca_step = [("pca", PCA(n_components=pca_components, random_state=42))] if use_pca else []
-    pca_label = f"PCA({pca_components}) + " if use_pca else ""
+    pca_label = dr_label
 
     regressors = {
         "Ridge":       Ridge(alpha=100.0),
@@ -441,8 +494,8 @@ def build_pipeline(model_name: str, pca_components: int = None) -> Pipeline:
 
     logging.info(f"Using {pca_label}{model_name}")
     return Pipeline([
-        ("scaler", StandardScaler()),
-        *pca_step,
+        *scaler_step,
+        *dr_step,
         ("reg", regressors[model_name]),
     ])
   
@@ -462,10 +515,26 @@ def run_single(
     pca_components: int = None,
     model_dir: Path = None,
     fold_by: str = "Protein Annotation",
+    dr_mode: str = None,
 ) -> dict:
     """Full pipeline for one embedding matrix using nested CV. Returns mean ± std metrics."""
     logging.info("=" * 60)
     logging.info(f"  {tag}")
+
+    if model_name == "Dummy":
+        y = df["Function Score"].to_numpy()
+        y_pred = np.full_like(y, y.mean())
+        mse = mean_squared_error(y, y_pred)
+        mae = mean_absolute_error(y, y_pred)
+        corr = _safe_corr(y, y_pred)
+        logging.info(f"Dummy baseline: mean={y.mean():.4f} | corr={corr} MSE={mse:.4f} MAE={mae:.4f}")
+        result = {"tag": tag}
+        for metric in ("train_corr", "train_mse", "train_mae",
+                       "val_corr",   "val_mse",   "val_mae",
+                       "test_corr",  "test_mse",  "test_mae"):
+            result[metric]          = corr if "corr" in metric else (mse if "mse" in metric else mae)
+            result[f"{metric}_std"] = float("nan")
+        return result
     logging.info("=" * 60)
 
     if fold_by not in df.columns:
@@ -478,11 +547,11 @@ def run_single(
 
     if n_groups == 2:
         fold_metrics, best_model = simple_cv(emb, y, groups, model_name=model_name,
-                                             pca_components=pca_components)
+                                             pca_components=pca_components, dr_mode=dr_mode)
     else:
         fold_metrics, best_model = nested_cv(emb, y, groups, model_name=model_name,
                                              outer_splits=outer_splits, inner_splits=inner_splits,
-                                             pca_components=pca_components)
+                                             pca_components=pca_components, dr_mode=dr_mode)
 
     if model_dir is not None and best_model is not None:
         model_dir = Path(model_dir)
@@ -530,10 +599,22 @@ def main(args):
 
     regime_label = "delta" if args.delta else "concat"
     for model_name in args.models:
-        tag = f"{model_name} | {regime_label} | {args.strand}"
-        results.append(run_single(emb, df, model_name=model_name,
-                                  tag=tag, pca_components=args.pca,
-                                  model_dir=args.model_dir, fold_by=args.fold_by))
+        if model_name == "GaussianProcess":
+            # Run GP with three DR options: PCA, PLS (supervised), and none
+            gp_dr_options = [("pca", "pca"), ("pls", "pls"), ("none", None)]
+            if not args.pca:
+                gp_dr_options = [("none", None)]  # no components specified — only plain GP
+            for dr_label, dr_mode in gp_dr_options:
+                tag = f"GaussianProcess-{dr_label} | {regime_label} | {args.strand}"
+                results.append(run_single(emb, df, model_name="GaussianProcess",
+                                          tag=tag, pca_components=args.pca,
+                                          model_dir=args.model_dir, fold_by=args.fold_by,
+                                          dr_mode=dr_mode))
+        else:
+            tag = f"{model_name} | {regime_label} | {args.strand}"
+            results.append(run_single(emb, df, model_name=model_name,
+                                      tag=tag, pca_components=args.pca,
+                                      model_dir=args.model_dir, fold_by=args.fold_by))
     results.append(run_single(emb, df, model_name="Dummy",
                               tag="Dummy (mean baseline)", pca_components=None,
                               model_dir=None, fold_by=args.fold_by))
@@ -554,6 +635,11 @@ def main(args):
             f"{m['test_mae']:>9.4f} {m['test_mae_std']:>7.4f}"
         )
 
+    # ── Save results CSV ───────────────────────────────────────────────────
+    results_dir = Path(args.log_dir)
+    results_csv = results_dir / f"results_{log_path.stem.removeprefix('run_')}.csv"
+    pd.DataFrame(results).to_csv(results_csv, index=False)
+    logging.info(f"Results saved to: {results_csv.resolve()}")
     logging.info(f"\nFull log saved to: {log_path.resolve()}")
 
 
