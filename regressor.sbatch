@@ -17,10 +17,4 @@ MODEL=${MODELS[$SLURM_ARRAY_TASK_ID]}
 
 echo "Running model: $MODEL (task $SLURM_ARRAY_TASK_ID)"
 
-apptainer run --bind $PWD:$PWD --pwd $PWD run_all.sif \
-    python regressor.py \
-        --emb emb_7B/ \
-        --delta --strand forward \
-        --models $MODEL \
-        --model_dir saved_models/ \
-        --log_dir logs/
+apptainer exec --bind $PWD:$PWD --pwd $PWD run_all.sif python regressor.py --emb emb_7B/ --delta --strand forward --models $MODEL --model_dir saved_models/ --log_dir logs/
