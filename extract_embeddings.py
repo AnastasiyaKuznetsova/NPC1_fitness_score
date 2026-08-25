@@ -4,14 +4,9 @@ import re
 
 import torch
 import numpy as np
-from evo2 import Evo2
-
-from transformer_engine.common.recipe import _OverrideLinearPrecision, DelayedScaling, Format # type: ignore[attr-defined]
-torch.serialization.add_safe_globals([_OverrideLinearPrecision, DelayedScaling, Format])
 
 DEFAULT_MODEL_ID = "evo2_7b"
 DEFAULT_LAYER_NAME = "blocks.28.mlp.l3"
-PAD_ID = 0
 BATCH_SIZE = 1
 DEVICE = (
     "cuda" if torch.cuda.is_available()
@@ -19,21 +14,22 @@ DEVICE = (
     else "cpu"
 )
 
-MODEL_CONFIG = {
+EVO2_MODEL_CONFIG = {
     "evo2_1b_base": {"num_layers": 25, "params": "1B"},
     "evo2_7b":      {"num_layers": 32, "params": "7B"},
     "evo2_40b":     {"num_layers": 50, "params": "40B"},
 }
 
+ALL_MODEL_CHOICES = list(EVO2_MODEL_CONFIG)
 
 
 def layer_index(layer: str) -> str:
-    m = re.search(r"blocks\.(\d+)\.", layer)
+    m = re.search(r"(?:blocks|layers)\.(\d+)\.", layer)
     return m.group(1) if m else layer
 
 
-def build_filename(seq_type: str, params: str, layer: str, mode: str, strand: str) -> str:
-    return f"{seq_type}_Evo2_{params}_L{layer_index(layer)}_{mode}_{strand}.npy"
+def build_filename(seq_type: str, model_family: str, params: str, layer: str, mode: str, strand: str) -> str:
+    return f"{seq_type}_{model_family}_{params}_L{layer_index(layer)}_{mode}_{strand}.npy"
 
 
 def pool(hidden: torch.Tensor, lengths: list[int], emb_type: str) -> torch.Tensor:
@@ -49,13 +45,42 @@ def pool(hidden: torch.Tensor, lengths: list[int], emb_type: str) -> torch.Tenso
         return hidden[torch.arange(hidden.shape[0], device=hidden.device), last_indices]
 
 
+# ── Evo2 ────────────────────────────────────────────────────────────────────────
+
+def load_evo2(model_name: str):
+    """Returns (model, pad_id, params_label). model exposes .tokenizer.tokenize(seq)
+    and .forward(input_ids, return_embeddings=True, layer_names=[...])."""
+    from evo2 import Evo2
+    from transformer_engine.common.recipe import (  # type: ignore[attr-defined]
+        _OverrideLinearPrecision, DelayedScaling, Format,
+    )
+    torch.serialization.add_safe_globals([_OverrideLinearPrecision, DelayedScaling, Format])
+
+    cfg = EVO2_MODEL_CONFIG[model_name]
+    print(f"Loading {model_name} ...")
+    model = Evo2(model_name)
+    print("Model loaded.\n")
+    # Evo2's tokenizer is a raw-byte tokenizer (no small fixed vocab / dedicated
+    # pad id) — any unused byte works as filler since pool() masks it out by length.
+    return model, 0, cfg["params"]
+
+
+def load_model(model_name: str):
+    """Returns (model, pad_id, params_label, model_family)."""
+    if model_name in EVO2_MODEL_CONFIG:
+        model, pad_id, params = load_evo2(model_name)
+        return model, pad_id, params, "Evo2"
+    raise ValueError(f"Unknown model {model_name!r}. Choose from: {ALL_MODEL_CHOICES}")
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract Evo2 embeddings from DNA/RNA sequences.")
-    parser.add_argument("--model", default=DEFAULT_MODEL_ID,
-                        help=f"Evo2 model variant (default: {DEFAULT_MODEL_ID})")
+    parser = argparse.ArgumentParser(description="Extract zero-shot embeddings from DNA/RNA sequences.")
+    parser.add_argument("--model", default=DEFAULT_MODEL_ID, choices=ALL_MODEL_CHOICES,
+                        help=f"Model variant (default: {DEFAULT_MODEL_ID}). Evo2: "
+                             f"{list(EVO2_MODEL_CONFIG)}.")
     parser.add_argument("--layer", nargs="+", default=[DEFAULT_LAYER_NAME],
                         help="One or more layer names to extract. All layers are extracted in a "
-                             f"single forward pass. (default: {DEFAULT_LAYER_NAME})")
+                             f"single forward pass. (default: {DEFAULT_LAYER_NAME}).")
     parser.add_argument("--seq-type", default="DNA", choices=["DNA", "RNA"],
                         help="Sequence type label in output filename (default: DNA)")
     parser.add_argument("--strand", default="forward", choices=["forward", "reverse"],
@@ -82,9 +107,10 @@ def extract_embeddings(
     layers: list[str],
     seq_type: str,
     strand: str,
+    model_family: str,
     params: str,
     batch_size: int = BATCH_SIZE,
-    pad_id: int = PAD_ID,
+    pad_id: int = 0,
 ) -> None:
     """
     Extract embeddings from one or more layers in a single forward pass per batch.
@@ -112,7 +138,7 @@ def extract_embeddings(
 
     for layer in layers:
         combined = np.concatenate(all_pooled[layer], axis=0)
-        fname = build_filename(seq_type, params, layer, emb_type, strand)
+        fname = build_filename(seq_type, model_family, params, layer, emb_type, strand)
         np.save(f"embeddings/{df}_{fname}", combined)
         print(f"Saved {emb_type} embeddings layer {layer_index(layer)}: {combined.shape} -> {df}_{fname}")
 
@@ -120,15 +146,9 @@ def extract_embeddings(
 if __name__ == "__main__":
     args = parse_args()
 
-    cfg = MODEL_CONFIG.get(args.model)
-    if cfg is None:
-        raise ValueError(f"Unknown model {args.model!r}. Add it to MODEL_CONFIG or check the name.")
-
     layers = args.layer
 
-    print(f"Loading {args.model} ...")
-    model = Evo2(args.model)
-    print("Model loaded.\n")
+    model, pad_id, params, model_family = load_model(args.model)
 
     input_files = {
         "ref_seq": args.ref_file or f"output/ref_seq_DNA_{args.strand}.npy",
@@ -144,7 +164,9 @@ if __name__ == "__main__":
             emb_type=args.emb_type,
             layers=layers,
             seq_type=args.seq_type,
-            params=cfg["params"],
+            model_family=model_family,
+            params=params,
             strand=args.strand,
             batch_size=args.batch_size,
+            pad_id=pad_id,
         )
