@@ -1,9 +1,50 @@
+"""
+Extract zero-shot Evo2 embeddings from the ref_seq/mut_seq windows written by
+prepare_dataset.py, pooled per layer into one .npy file each.
+
+Model / layers
+  --model          Evo2 variant: evo2_1b_base, evo2_7b (default), evo2_40b.
+  --layer          One or more layer names (e.g. blocks.28.mlp.l3), extracted
+                    together in a single forward pass. Default: blocks.28.mlp.l3.
+
+Input
+  --ref-file       Reference sequences .npy. Default: output/ref_seq_DNA_{strand}.npy
+  --mut-file       Mutant sequences .npy.    Default: output/mut_seq_DNA_{strand}.npy
+  --seq-type       DNA or RNA — only affects the output filename label. Default: DNA.
+  --strand         forward or reverse — selects the default input files and labels
+                    output. Default: forward.
+  --batch-size     Sequences per forward pass. Default: 1.
+
+Pooling
+  --pool-region    'full' (default): pool over the whole sequence.
+                    'downstream': pool only positions after the edit — requires
+                    --variant-meta-file.
+  --emb-type       'average': mean over the pooled region. 'last': last token —
+                    only valid with --pool-region full. Default: average.
+  --downstream-k   Only used with --pool-region downstream. One or more window
+                    sizes to test: an integer k means positions [edit_end,
+                    edit_end+k] inclusive (k=0 = just the mutation-site
+                    embedding), or 'all' for everything to the sequence end.
+                    One output file is saved per k, e.g. --downstream-k 0 32
+                    128 512 all. Default: all.
+  --variant-meta-file
+                    variant_meta.csv written by prepare_dataset.py (columns
+                    pos, ref, alt, edit_start), row-aligned with --ref-file/
+                    --mut-file. Required for --pool-region downstream.
+                    Default: output/variant_meta.csv.
+
+Output
+  One embeddings/{ref_seq,mut_seq}_{seq_type}_{model_family}_{params}_L{layer}_
+  {emb_type}_{strand}[_ds{k}].npy per layer (and per k, if swept), shape (N, D).
+"""
+
 import argparse
 import os
 import re
 
 import torch
 import numpy as np
+import pandas as pd
 
 DEFAULT_MODEL_ID = "evo2_7b"
 DEFAULT_LAYER_NAME = "blocks.28.mlp.l3"
@@ -51,8 +92,7 @@ def pool_downstream(hidden: torch.Tensor, lengths: list[int], starts: list[int],
     """Mean over positions [start, start+k] per sequence (inclusive — k=0 is
     just the mutation-site position itself; k == "all" means [start, length)),
     where `start` is where the edit ends in that sequence (see main() for how
-    forward/reverse starts are derived from prepare_dataset.py's
-    edit_start/ref_len/alt_len metadata)."""
+    forward/reverse starts are derived from prepare_dataset.py's variant_meta.csv)."""
     B, L = hidden.shape[0], hidden.shape[1]
     region_start = [min(s, l) for s, l in zip(starts, lengths)]
     region_end = lengths if k == "all" else [min(s + k + 1, l) for s, l in zip(starts, lengths)]
@@ -131,26 +171,18 @@ def parse_args() -> argparse.Namespace:
                              "Default: output/mut_seq_DNA_{strand}.npy")
     parser.add_argument("--pool-region", default="full", choices=["full", "downstream"],
                         help="'full' (default) pools over the whole sequence. 'downstream' "
-                             "pools only positions after the edit, using the edit_start/"
-                             "ref_len/alt_len metadata written by prepare_dataset.py.")
+                             "pools only positions after the edit, using the variant metadata "
+                             "CSV written by prepare_dataset.py.")
     parser.add_argument("--downstream-k", nargs="+", default=["all"], type=_parse_k, metavar="K",
                         help="Window sizes to test when --pool-region downstream: each is either "
                              "an integer k (positions [edit_end, edit_end+k], inclusive — k=0 means "
                              "just the mutation-site embedding) or the literal 'all' (everything "
                              "from the edit to the sequence end). One output file is saved per k, "
                              "e.g. --downstream-k 0 32 128 512 all. Default: all")
-    parser.add_argument("--edit-start-file", default=None, metavar="FILE",
-                        help="Path to per-variant edit-start positions (.npy int array) written by "
-                             "prepare_dataset.py. Default: output/edit_start.npy. Required for "
-                             "--pool-region downstream.")
-    parser.add_argument("--ref-len-file", default=None, metavar="FILE",
-                        help="Path to per-variant ref-allele lengths (.npy int array) written by "
-                             "prepare_dataset.py. Default: output/ref_len.npy. Required for "
-                             "--pool-region downstream.")
-    parser.add_argument("--alt-len-file", default=None, metavar="FILE",
-                        help="Path to per-variant alt-allele lengths (.npy int array) written by "
-                             "prepare_dataset.py. Default: output/alt_len.npy. Required for "
-                             "--pool-region downstream.")
+    parser.add_argument("--variant-meta-file", default=None, metavar="FILE",
+                        help="Path to the variant_meta.csv written by prepare_dataset.py (columns "
+                             "pos, ref, alt, edit_start; row-aligned with --ref-file/--mut-file). "
+                             "Default: output/variant_meta.csv. Required for --pool-region downstream.")
     args = parser.parse_args()
 
     if args.pool_region == "downstream" and args.emb_type != "average":
@@ -228,9 +260,10 @@ if __name__ == "__main__":
 
     edit_start = ref_len = alt_len = None
     if args.pool_region == "downstream":
-        edit_start = np.load(args.edit_start_file or "output/edit_start.npy")
-        ref_len = np.load(args.ref_len_file or "output/ref_len.npy")
-        alt_len = np.load(args.alt_len_file or "output/alt_len.npy")
+        meta = pd.read_csv(args.variant_meta_file or "output/variant_meta.csv")
+        edit_start = meta["edit_start"].to_numpy()
+        ref_len = meta["ref"].astype(str).str.len().to_numpy()
+        alt_len = meta["alt"].astype(str).str.len().to_numpy()
 
     for df, path in input_files.items():
         seqs = np.load(path)
