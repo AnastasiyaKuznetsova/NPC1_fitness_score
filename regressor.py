@@ -41,6 +41,7 @@ from sklearn.dummy import DummyRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.cross_decomposition import PLSRegression
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.svm import SVR
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -52,15 +53,38 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from scipy.stats import spearmanr
 from sklearn.pipeline import Pipeline
 
+class PLSTransformer(BaseEstimator, TransformerMixin):
+    """PLSRegression as a supervised DR step. Squeezes the (N, K, 1) output to (N, K)."""
+
+    def __init__(self, n_components=10):
+        self.n_components = n_components
+
+    def fit(self, X, y):
+        self._pls = PLSRegression(n_components=self.n_components)
+        self._pls.fit(X, y)
+        return self
+
+    def transform(self, X):
+        out = self._pls.transform(X)
+        return out.squeeze(-1) if out.ndim == 3 else out
+
+    def get_params(self, deep=True):
+        return {"n_components": self.n_components}
+
+    def set_params(self, **params):
+        if "n_components" in params:
+            self.n_components = params["n_components"]
+        return self
+
+
 MODELS = [
     "Ridge", "Lasso", "ElasticNet",
     "KernelRidge", "SVR", "PLS", "GaussianProcess", "kNN",
     "RandomForest", "DecisionTree", "Dummy",
 ]
 
-_GP_BOUNDS = (1e-7, 1e6)  # wider than sklearn's (1e-5, 1e5) default on every tunable
-                           # kernel hyperparameter, so the internal MLE optimizer has
-                           # room to move off the bound instead of raising ConvergenceWarning
+_GP_BOUNDS = (1e-10, 1e6)  # wider than sklearn's (1e-5, 1e5) default; noise lower bound
+                            # set to 1e-10 to prevent hitting the floor on low-noise data
 
 GP_KERNELS = [
     RBF(length_scale_bounds=_GP_BOUNDS) + WhiteKernel(noise_level_bounds=_GP_BOUNDS),
@@ -115,11 +139,17 @@ def setup_logging(log_dir: str = "logs") -> Path:
 
     logging.info(f"Log file: {log_path.resolve()}")
 
-    # Route Python warnings to the log file only (not stdout)
+    # Route Python warnings to the log file in the main process
     logging.captureWarnings(True)
     warnings.simplefilter("always")
     logging.getLogger("py.warnings").handlers = [fh]
     logging.getLogger("py.warnings").propagate = False
+
+    # Suppress warnings in sklearn worker processes (n_jobs=-1 forks bypass logging)
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", message="An ill-conditioned matrix")
+    warnings.filterwarnings("ignore", message="Objective did not converge")
+    warnings.filterwarnings("ignore", message="The optimal value found for dimension")
 
     return log_path
 
@@ -458,7 +488,7 @@ def build_pipeline(model_name: str, pca_components: int = None, dr_mode: str = N
         dr_step = [("dr", PCA(n_components=pca_components, random_state=42))]
         dr_label = f"PCA({pca_components}) + "
     elif pca_components and dr_mode == "pls" and model_name != "PLS":
-        dr_step = [("dr", PLSRegression(n_components=min(pca_components, 20)))]
+        dr_step = [("dr", PLSTransformer(n_components=min(pca_components, 20)))]
         dr_label = f"PLS-DR({pca_components}) + "
     elif pca_components and model_name != "PLS" and dr_mode is None:
         # Legacy behaviour for non-GP models: --pca uses PCA by default
