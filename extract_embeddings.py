@@ -22,11 +22,12 @@ Pooling
   --emb-type       'average': mean over the pooled region. 'last': last token —
                     only valid with --pool-region full. Default: average.
   --downstream-k   Only used with --pool-region downstream. One or more window
-                    sizes to test: an integer k means positions [edit_end,
-                    edit_end+k] inclusive (k=0 = just the mutation-site
-                    embedding), or 'all' for everything to the sequence end.
-                    One output file is saved per k, e.g. --downstream-k 0 32
-                    128 512 all. Default: all.
+                    sizes to test: an integer k means positions [start, start+k]
+                    inclusive, where start is the allele's own last base — the
+                    earliest position whose causal context has fully seen the
+                    edit (k=0 = just that position), or 'all' for everything to
+                    the sequence end. One output file is saved per k, e.g.
+                    --downstream-k 0 32 128 512 all. Default: all.
   --variant-meta-file
                     variant_meta.csv written by prepare_dataset.py (columns
                     pos, ref, alt, edit_start), row-aligned with --ref-file/
@@ -90,9 +91,10 @@ def pool(hidden: torch.Tensor, lengths: list[int], emb_type: str) -> torch.Tenso
 
 def pool_downstream(hidden: torch.Tensor, lengths: list[int], starts: list[int], k) -> torch.Tensor:
     """Mean over positions [start, start+k] per sequence (inclusive — k=0 is
-    just the mutation-site position itself; k == "all" means [start, length)),
-    where `start` is where the edit ends in that sequence (see main() for how
-    forward/reverse starts are derived from prepare_dataset.py's variant_meta.csv)."""
+    just the allele's own last base; k == "all" means [start, length)), where
+    `start` is the earliest position whose causal context has fully seen the
+    allele (see main() for how forward/reverse starts are derived from
+    prepare_dataset.py's variant_meta.csv)."""
     B, L = hidden.shape[0], hidden.shape[1]
     region_start = [min(s, l) for s, l in zip(starts, lengths)]
     region_end = lengths if k == "all" else [min(s + k + 1, l) for s, l in zip(starts, lengths)]
@@ -159,10 +161,10 @@ def parse_args() -> argparse.Namespace:
                         help=f"Sequences per forward pass (default: {BATCH_SIZE})")
     parser.add_argument("--emb-type", default="average", choices=["average", "last"],
                         help="Pooling: 'average' = mean over the pooled region (the whole sequence "
-                             "for --pool-region full, or [start, start+k] for downstream — use "
-                             "--downstream-k 0 for just the mutation-site embedding); "
-                             "'last' = last token — only valid with --pool-region full. "
-                             "(default: average)")
+                             "for --pool-region full, or [start, start+k] for downstream, where "
+                             "start is the allele's own last base — use --downstream-k 0 for just "
+                             "that position); 'last' = last token — only valid with --pool-region "
+                             "full. (default: average)")
     parser.add_argument("--ref-file", default=None, metavar="FILE",
                         help="Path to reference sequences .npy file. "
                              "Default: output/ref_seq_DNA_{strand}.npy")
@@ -171,14 +173,16 @@ def parse_args() -> argparse.Namespace:
                              "Default: output/mut_seq_DNA_{strand}.npy")
     parser.add_argument("--pool-region", default="full", choices=["full", "downstream"],
                         help="'full' (default) pools over the whole sequence. 'downstream' "
-                             "pools only positions after the edit, using the variant metadata "
-                             "CSV written by prepare_dataset.py.")
+                             "pools from the allele's own last base onward, using the variant "
+                             "metadata CSV written by prepare_dataset.py.")
     parser.add_argument("--downstream-k", nargs="+", default=["all"], type=_parse_k, metavar="K",
                         help="Window sizes to test when --pool-region downstream: each is either "
-                             "an integer k (positions [edit_end, edit_end+k], inclusive — k=0 means "
-                             "just the mutation-site embedding) or the literal 'all' (everything "
-                             "from the edit to the sequence end). One output file is saved per k, "
-                             "e.g. --downstream-k 0 32 128 512 all. Default: all")
+                             "an integer k (positions [start, start+k], inclusive, where start is "
+                             "the allele's own last base — the earliest position whose causal "
+                             "context has fully seen the edit; k=0 means just that position) or "
+                             "the literal 'all' (everything from start to the sequence end). One "
+                             "output file is saved per k, e.g. --downstream-k 0 32 128 512 all. "
+                             "Default: all")
     parser.add_argument("--variant-meta-file", default=None, metavar="FILE",
                         help="Path to the variant_meta.csv written by prepare_dataset.py (columns "
                              "pos, ref, alt, edit_start; row-aligned with --ref-file/--mut-file). "
@@ -271,17 +275,19 @@ if __name__ == "__main__":
         starts = None
         if args.pool_region == "downstream":
             if args.strand == "forward":
-                # Downstream of the edit = right after the allele actually present
-                # in this sequence (ref allele for ref_seq, alt allele for mut_seq).
+                # start = the allele's own last base (the earliest position whose
+                # causal context has seen the whole allele) — ref allele for
+                # ref_seq, alt allele for mut_seq, since their lengths can differ.
                 allele_len = ref_len if df == "ref_seq" else alt_len
-                starts = (edit_start + allele_len).tolist()
+                starts = (edit_start + allele_len - 1).tolist()
             else:
-                # Reverse-complementing flips the sequence, so "downstream" in the
-                # reverse-strand direction is the mirror of "upstream" in the
-                # forward window: start = seq_len - edit_start (same for ref/mut,
-                # since edit_start marks where the allele begins, not where it ends).
+                # Reverse-complementing flips reading direction, so the allele's
+                # last base *in the reverse array's own left-to-right order* is
+                # the locus at forward position edit_start (the allele's first
+                # base) — independent of allele length, same for ref/mut.
+                # start = seq_len - edit_start - 1
                 seq_lens = np.array([len(s) for s in seqs])
-                starts = (seq_lens - edit_start).tolist()
+                starts = (seq_lens - edit_start - 1).tolist()
 
         extract_embeddings(
             sequences=seqs,
