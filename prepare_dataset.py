@@ -12,13 +12,22 @@ Three input modes:
 For modes 2 & 3 the chromosome accession is resolved automatically via --accession
 (default: NC_000018.10 for chr18). Pass --accession for a different chromosome.
 
-Saves four .npy arrays to --out_dir:
-    ref_seq_DNA_forward.npy
-    ref_seq_DNA_reverse.npy
-    mut_seq_DNA_forward.npy
-    mut_seq_DNA_reverse.npy
+Saves five files to --out_dir:
 
-Each array has shape (N,) of strings, one per variant.
+  Four sequence-window .npy arrays, shape (N,) of strings, row i is the
+  same variant as row i of variant_meta.csv below:
+
+    ref_seq_DNA_forward.npy   ref_seq_DNA_reverse.npy
+    mut_seq_DNA_forward.npy   mut_seq_DNA_reverse.npy
+
+    
+  One variant_meta.csv, row-aligned with the four arrays above, with
+  columns pos/ref/alt (the variant as parsed) and edit_start (0-based
+  index within the forward window where the allele begins — same for
+  ref_seq and mut_seq, since both windows share the same left context).
+  extract_embeddings.py's --pool-region downstream reads this to find
+  where each variant's allele sits in its window (ref_len/alt_len are
+  just len(ref)/len(alt) from this file).
 
 Examples
 --------
@@ -34,8 +43,6 @@ python prepare_dataset.py --coords chr18:25290796:A:T
 # Multiple variants from CLI:
 python prepare_dataset.py --coords chr18:25290796:A:T chr18:25291000:G:C
 
-# Provide a local FASTA instead of fetching:
-python prepare_dataset.py --tsv data/npc1_2star_GRCh38.tsv --fasta data/chr18.fa
 """
 
 import argparse
@@ -224,7 +231,7 @@ def main():
 
     # Output
     parser.add_argument("--out_dir", default=OUTPUT_DIR,
-                        help=f"Directory for output .npy files. Default: {OUTPUT_DIR}")
+                        help=f"Directory for output files. Default: {OUTPUT_DIR}")
     parser.add_argument("--window", type=int, default=WINDOW_SIZE,
                         help=f"Sequence window size in bp (centered on the variant). "
                              f"Default: {WINDOW_SIZE}")
@@ -269,17 +276,14 @@ def main():
         genome = fetch_genome(args.accession)
 
     # ── Build windows ──────────────────────────────────────────────────────────
-    ref_seqs, mut_seqs = [], []
-    edit_starts, ref_lens, alt_lens = [], [], []
+    ref_seqs, mut_seqs, meta_rows = [], [], []
     skipped = 0
     for i, row in variants.iterrows():
         try:
             ref_w, mut_w, edit_start = extract_window(genome, row["pos"], row["ref"], row["alt"], args.window)
             ref_seqs.append(ref_w)
             mut_seqs.append(mut_w)
-            edit_starts.append(edit_start)
-            ref_lens.append(len(row["ref"]))
-            alt_lens.append(len(row["alt"]))
+            meta_rows.append({"pos": row["pos"], "ref": row["ref"], "alt": row["alt"], "edit_start": edit_start})
         except ValueError as e:
             print(f"  SKIP variant {i} (pos={row['pos']}): {e}")
             skipped += 1
@@ -304,16 +308,18 @@ def main():
         (f"{p}ref_seq_DNA_reverse_{date_str}.npy", ref_reverse),
         (f"{p}mut_seq_DNA_forward_{date_str}.npy", mut_forward),
         (f"{p}mut_seq_DNA_reverse_{date_str}.npy", mut_reverse),
-        # Edit-position metadata, index-aligned with the four sequence arrays
-        # above. Lets extract_embeddings.py's --pool-region downstream find
-        # where the variant sits in each window without recomputing it.
-        (f"{p}edit_start_{date_str}.npy", np.array(edit_starts, dtype=np.int64)),
-        (f"{p}ref_len_{date_str}.npy", np.array(ref_lens, dtype=np.int64)),
-        (f"{p}alt_len_{date_str}.npy", np.array(alt_lens, dtype=np.int64)),
     ]:
         out_path = out_dir / fname
         np.save(out_path, arr)
         print(f"  Saved {len(arr)} sequences → {out_path}")
+
+    # Edit-position metadata, row-aligned with the four sequence arrays above.
+    # Lets extract_embeddings.py's --pool-region downstream find where the
+    # variant sits in each window without recomputing it.
+    meta_path = out_dir / f"{p}variant_meta_{date_str}.csv"
+    pd.DataFrame(meta_rows).to_csv(meta_path, index=False)
+    print(f"  Saved {len(meta_rows)} rows → {meta_path}")
+
     print(f"\nDone. {len(ref_forward)} sequence pairs written to {out_dir}/")
 
 
