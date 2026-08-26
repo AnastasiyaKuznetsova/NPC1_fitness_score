@@ -73,6 +73,27 @@ def extract_layer_pooling_combos(emb_dir: Path, strand: str) -> list[tuple[str, 
     return combos
 
 
+def extract_downstream_k_variants(emb_dir: Path, strand: str) -> list:
+    """Return every --pool-region region found in ref_seq_*{strand}*.npy filenames:
+    None for the plain full-sequence files, plus a string per '_ds{k}' suffix
+    (e.g. '0', '32', 'all') written by extract_embeddings.py --pool-region downstream.
+    Sorted with None (full) first, then k's in ascending numeric order ('all' last).
+    """
+    files = sorted(emb_dir.rglob(f"ref_seq_*{strand}*.npy"))
+    variants = set()
+    for f in files:
+        m = re.search(r"_ds(\w+)\.npy$", f.name)
+        variants.add(m.group(1) if m else None)
+
+    def sort_key(k):
+        if k is None:
+            return (0, 0)
+        if k == "all":
+            return (2, 0)
+        return (1, int(k))
+    return sorted(variants, key=sort_key)
+
+
 def setup_run_logging(out_dir: Path, run_name: str) -> None:
     log_path = out_dir / f"{run_name}.log"
     fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S")
@@ -180,55 +201,61 @@ def main():
     else:  # dna
         for strand_label, use_reverse, ref_strand in strand_configs:
             layer_pool_combos = extract_layer_pooling_combos(emb_dir, ref_strand)
+            downstream_k_variants = extract_downstream_k_variants(emb_dir, ref_strand)
             for layer, pooling in layer_pool_combos:
-                group_name = f"L{layer}_{pooling}_{strand_label}"
-                setup_run_logging(out_dir, group_name)
+                for k in downstream_k_variants:
+                    k_label = "full" if k is None else f"ds{k}"
+                    group_name = f"L{layer}_{pooling}_{strand_label}_{k_label}"
+                    setup_run_logging(out_dir, group_name)
 
-                # Load embeddings once per layer/pooling/strand — shared across model combos
-                layer_emb = _LayerFilteredDir(emb_dir, layer, pooling)
-                try:
-                    df_fwd, emb_fwd = load_data_dna(
-                        args.df, layer_emb, delta=False, use_reverse=use_reverse, strand=ref_strand,
-                    )
-                    _, emb_delta = load_data_dna(
-                        args.df, layer_emb, delta=True, use_reverse=use_reverse, strand=ref_strand,
-                    )
-                except Exception as e:
-                    logging.error(f"FAILED loading {group_name}: {e}")
-                    continue
-
-                sample_files = sorted(emb_dir.rglob(f"ref_seq_*{ref_strand}*L{layer}*{pooling}*.npy"))
-                model_arch = "Evo2"
-                if sample_files:
-                    m = re.search(r"_(Evo2)_(\w+)_", sample_files[0].name)
-                    if m:
-                        model_arch = f"{m.group(1)}_{m.group(2)}"
-
-                for c in model_configs:
-                    run_name = f"{group_name}_{c['model_name']}_{c['emb_type']}"
-                    logging.info(f"Run: {run_name}")
-                    emb_data = emb_delta if c["delta"] else emb_fwd
-
+                    # Load embeddings once per layer/pooling/strand/k — shared across model combos
+                    layer_emb = _LayerFilteredDir(emb_dir, layer, pooling)
                     try:
-                        metrics = run_combo(
-                            emb_data, df_fwd, model_name=c["model_name"],
-                            tag=run_name, pca_components=args.pca,
-                            model_dir=args.model_dir, run_timestamp=run_timestamp,
+                        df_fwd, emb_fwd = load_data_dna(
+                            args.df, layer_emb, delta=False, use_reverse=use_reverse,
+                            strand=ref_strand, downstream_k=k,
+                        )
+                        _, emb_delta = load_data_dna(
+                            args.df, layer_emb, delta=True, use_reverse=use_reverse,
+                            strand=ref_strand, downstream_k=k,
                         )
                     except Exception as e:
-                        logging.error(f"FAILED {run_name}: {e}")
+                        logging.error(f"FAILED loading {group_name}: {e}")
                         continue
 
-                    all_results.append({
-                        "layer":      f"L{layer}",
-                        "model_arch": model_arch,
-                        "pooling":    pooling,
-                        "emb_type":   c["emb_type"],
-                        "strand":     strand_label,
-                        "model":      c["model_name"],
-                        "hyperparams": get_hyperparams(c["model_name"], pca_components=args.pca),
-                        **metrics,
-                    })
+                    sample_files = sorted(emb_dir.rglob(f"ref_seq_*{ref_strand}*L{layer}*{pooling}*.npy"))
+                    model_arch = "Evo2"
+                    if sample_files:
+                        m = re.search(r"_(Evo2)_(\w+)_", sample_files[0].name)
+                        if m:
+                            model_arch = f"{m.group(1)}_{m.group(2)}"
+
+                    for c in model_configs:
+                        run_name = f"{group_name}_{c['model_name']}_{c['emb_type']}"
+                        logging.info(f"Run: {run_name}")
+                        emb_data = emb_delta if c["delta"] else emb_fwd
+
+                        try:
+                            metrics = run_combo(
+                                emb_data, df_fwd, model_name=c["model_name"],
+                                tag=run_name, pca_components=args.pca,
+                                model_dir=args.model_dir, run_timestamp=run_timestamp,
+                            )
+                        except Exception as e:
+                            logging.error(f"FAILED {run_name}: {e}")
+                            continue
+
+                        all_results.append({
+                            "layer":        f"L{layer}",
+                            "model_arch":   model_arch,
+                            "pooling":      pooling,
+                            "downstream_k": k_label,
+                            "emb_type":     c["emb_type"],
+                            "strand":       strand_label,
+                            "model":        c["model_name"],
+                            "hyperparams": get_hyperparams(c["model_name"], pca_components=args.pca),
+                            **metrics,
+                        })
 
     metrics_df = pd.DataFrame(all_results)
     csv_path = out_dir / "metrics.csv"
@@ -237,7 +264,7 @@ def main():
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
-    cols = ["layer", "model_arch", "pooling", "emb_type", "strand", "model",
+    cols = ["layer", "model_arch", "pooling", "downstream_k", "emb_type", "strand", "model",
             "train_corr", "train_corr_std", "val_corr", "val_corr_std",
             "test_corr", "test_corr_std", "test_mse", "test_mse_std", "test_mae", "test_mae_std"]
     summary_cols = [c for c in cols if c in metrics_df.columns]
@@ -253,12 +280,14 @@ class _LayerFilteredDir:
         self._pooling = pooling
 
     def glob(self, pattern: str):
-        # Filename format: {ref_seq|mut_seq}_*_L{layer}_{pooling}_{strand}.npy
-        # Extract prefix (ref_seq / mut_seq) and strand from caller's pattern.
+        # Filename format: {ref_seq|mut_seq}_*_L{layer}_{pooling}_{strand}[_ds{k}].npy
+        # _load_ref_mut() already builds `pattern` as "{prefix}_*{tail}" where tail is
+        # anchored at the end (e.g. "forward.npy" or "forward_ds32.npy") — forward that
+        # tail unchanged and just insert the layer/pooling filter after the prefix, so
+        # this stays correct regardless of whether a downstream-k suffix is present.
         prefix = "ref_seq" if pattern.startswith("ref_seq") else "mut_seq"
-        m = re.search(r"\*(forward|reverse)\*", pattern)
-        strand = m.group(1) if m else "*"
-        filtered_pattern = f"{prefix}_*L{self._layer}*{self._pooling}*{strand}*.npy"
+        tail = pattern[len(prefix) + 1:].lstrip("*")
+        filtered_pattern = f"{prefix}_*L{self._layer}*{self._pooling}*{tail}"
         return self._path.rglob(filtered_pattern)
 
     def __str__(self):

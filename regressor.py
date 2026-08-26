@@ -164,29 +164,44 @@ def load_data_rna(path_to_df: str, path_to_emb: str) -> tuple[pd.DataFrame, np.n
     return df, emb
 
 
-def _load_ref_mut(emb_dir, strand: str, layer: str = None, pooling: str = None) -> tuple[np.ndarray, np.ndarray]:
-    """Load refs_*{strand}*.npy and muts_*{strand}*.npy from a directory, squeeze to (N, D)."""
+def _load_ref_mut(emb_dir, strand: str, layer: str = None, pooling: str = None,
+                   downstream_k: str = None) -> tuple[np.ndarray, np.ndarray]:
+    """Load refs_*{strand}*.npy and muts_*{strand}*.npy from a directory, squeeze to (N, D).
+
+    downstream_k disambiguates extract_embeddings.py's --pool-region downstream
+    outputs, which add a '_ds{k}' suffix after the strand (e.g. '..._forward_ds32.npy').
+    None (default) selects the plain full-sequence file ('..._forward.npy', no
+    '_ds' suffix); a value like '0', '32', ... or 'all' selects that specific k.
+    """
     if not hasattr(emb_dir, "glob"):
         emb_dir = Path(emb_dir)
 
+    # Anchor at the end of the filename so 'full' (no suffix) and a specific k
+    # never accidentally match each other's files.
+    tail = f"{strand}.npy" if downstream_k is None else f"{strand}_ds{downstream_k}.npy"
+
     if layer is not None and pooling is not None:
-        ref_files = sorted(emb_dir.rglob(f"ref_seq_*L{layer}*{pooling}*{strand}*.npy"))
-        mut_files = sorted(emb_dir.rglob(f"mut_seq_*L{layer}*{pooling}*{strand}*.npy"))
+        ref_files = sorted(emb_dir.rglob(f"ref_seq_*L{layer}*{pooling}*{tail}"))
+        mut_files = sorted(emb_dir.rglob(f"mut_seq_*L{layer}*{pooling}*{tail}"))
     else:
-        ref_files = sorted(emb_dir.glob(f"ref_seq_*{strand}*.npy"))
-        mut_files = sorted(emb_dir.glob(f"mut_seq_*{strand}*.npy"))
+        ref_files = sorted(emb_dir.glob(f"ref_seq_*{tail}"))
+        mut_files = sorted(emb_dir.glob(f"mut_seq_*{tail}"))
 
-    # Fall back to any ref/mut file if no strand-specific files found
-    # (older directories where strand is indicated by folder name, not filename)
-    if not ref_files:
-        ref_files = sorted(emb_dir.glob("ref_seq_*.npy"))
-    if not mut_files:
-        mut_files = sorted(emb_dir.glob("mut_seq_*.npy"))
+    # Fall back to any ref/mut file if no strand-specific files found (older
+    # directories where strand is indicated by folder name, not filename).
+    # Skipped when downstream_k is set — silently grabbing an unrelated k (or
+    # the full-sequence file) would corrupt the comparison, so surface a clear
+    # FileNotFoundError below instead.
+    if downstream_k is None:
+        if not ref_files:
+            ref_files = sorted(emb_dir.glob("ref_seq_*.npy"))
+        if not mut_files:
+            mut_files = sorted(emb_dir.glob("mut_seq_*.npy"))
 
     if not ref_files:
-        raise FileNotFoundError(f"No ref_seq_*.npy files found in {str(emb_dir)}")
+        raise FileNotFoundError(f"No ref_seq_*{tail} files found in {str(emb_dir)}")
     if not mut_files:
-        raise FileNotFoundError(f"No mut_seq_*.npy files found in {str(emb_dir)}")
+        raise FileNotFoundError(f"No mut_seq_*{tail} files found in {str(emb_dir)}")
     if len(ref_files) != 1 or len(mut_files) != 1:
         raise ValueError(
             f"Expected exactly one refs and one muts file for strand '{strand}', "
@@ -225,6 +240,7 @@ def load_data_dna(
     strand: str = "forward",
     layer: str = None,
     pooling: str = None,
+    downstream_k: str = None,
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """
     DNA path: loads strand embeddings from emb directory.
@@ -237,18 +253,20 @@ def load_data_dna(
 
     if use_reverse:
         logging.info("Loading forward-strand embeddings:")
-        ref_fwd, mut_fwd = _load_ref_mut(emb, "forward", layer=layer, pooling=pooling)
+        ref_fwd, mut_fwd = _load_ref_mut(emb, "forward", layer=layer, pooling=pooling,
+                                          downstream_k=downstream_k)
         emb_fwd = _pool(ref_fwd, mut_fwd, delta)
         logging.info(f"  forward pool shape: {emb_fwd.shape}")
         logging.info("Loading reverse-strand embeddings:")
-        ref_rev, mut_rev = _load_ref_mut(emb, "reverse", layer=layer, pooling=pooling)
+        ref_rev, mut_rev = _load_ref_mut(emb, "reverse", layer=layer, pooling=pooling,
+                                          downstream_k=downstream_k)
         emb_rev = _pool(ref_rev, mut_rev, delta)
         logging.info(f"  reverse pool shape: {emb_rev.shape}")
         emb_out = np.concatenate([emb_fwd, emb_rev], axis=1)
         logging.info(f"  combined shape: {emb_out.shape}")
     else:
         logging.info(f"Loading {strand}-strand embeddings:")
-        ref, mut = _load_ref_mut(emb, strand, layer=layer, pooling=pooling)
+        ref, mut = _load_ref_mut(emb, strand, layer=layer, pooling=pooling, downstream_k=downstream_k)
         emb_out = _pool(ref, mut, delta)
         logging.info(f"  {strand} pool shape: {emb_out.shape}")
 
@@ -623,7 +641,8 @@ def main(args):
         strand = "forward" if args.strand != "reverse" else "reverse"
         regime = "delta" if args.delta else "concat"
         df, emb = load_data_dna(args.df, args.emb, args.delta, use_reverse=use_reverse,
-                                 strand=strand, layer=args.layer, pooling=args.pooling)
+                                 strand=strand, layer=args.layer, pooling=args.pooling,
+                                 downstream_k=args.downstream_k)
     else:
         raise ValueError(f"Unknown emb_mode: {args.emb_mode}")
 
@@ -704,6 +723,11 @@ if __name__ == "__main__":
     parser.add_argument("--pooling", choices=["average", "last"], default=None,
                         help="[DNA mode] Pooling mode: 'average' or 'last'. Required when the "
                              "embedding directory contains multiple pooling modes.")
+    parser.add_argument("--downstream-k", default=None, metavar="K",
+                        help="[DNA mode] Select a --pool-region downstream variant written by "
+                             "extract_embeddings.py: an integer (e.g. 0, 32, 128, 512) or 'all'. "
+                             "Omit to load the plain full-sequence embeddings instead. Required "
+                             "when the embedding directory contains both, or multiple k's.")
 
     parser.add_argument("--fold_by", choices=["Protein Annotation", "merged_region"],
                         default="Protein Annotation",
@@ -712,8 +736,9 @@ if __name__ == "__main__":
 
     # Model args
     parser.add_argument("--models", nargs="+", default=["Ridge"],
-                        choices=MODELS,
-                        help=f"Models to run (default: Ridge). Choices: {MODELS}")
+                        choices=MODELS + ["all"],
+                        help=f"Models to run (default: Ridge), or 'all' to run every model. "
+                             f"Choices: {MODELS}")
 
     # Logging
     parser.add_argument("--pca", type=int, default=None,
@@ -726,6 +751,13 @@ if __name__ == "__main__":
                         help="Directory for log files. Default: logs/")
 
     args = parser.parse_args()
+    if "all" in args.models:
+        args.models = MODELS
+    if args.downstream_k is not None and args.downstream_k != "all":
+        try:
+            int(args.downstream_k)
+        except ValueError:
+            parser.error(f"--downstream-k must be 'all' or an integer, got {args.downstream_k!r}")
     main(args)
 
 
