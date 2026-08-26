@@ -1,3 +1,7 @@
+import torch
+from transformer_engine.common.recipe import _OverrideLinearPrecision
+torch.serialization.add_safe_globals([_OverrideLinearPrecision])
+
 from evo2.models import Evo2
 import numpy as np
 import pandas as pd
