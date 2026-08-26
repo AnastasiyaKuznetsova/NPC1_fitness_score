@@ -14,13 +14,13 @@ For modes 2 & 3 the chromosome accession is resolved automatically via --accessi
 
 Saves five files to --out_dir:
 
-  Four sequence-window .npy arrays, shape (N,) of strings, row i is the
-  same variant as row i of variant_meta.csv below:
+  Four sequence-window .npy arrays, shape (N,) of strings (or (N*K,) with
+  --jitter — see below), row i is the same variant as row i of
+  variant_meta.csv below:
 
     ref_seq_DNA_forward.npy   ref_seq_DNA_reverse.npy
     mut_seq_DNA_forward.npy   mut_seq_DNA_reverse.npy
 
-    
   One variant_meta.csv, row-aligned with the four arrays above, with
   columns pos/ref/alt (the variant as parsed) and edit_start (0-based
   index within the forward window where the allele begins — same for
@@ -28,6 +28,12 @@ Saves five files to --out_dir:
   extract_embeddings.py's --pool-region downstream reads this to find
   where each variant's allele sits in its window (ref_len/alt_len are
   just len(ref)/len(alt) from this file).
+
+  --jitter augmentation: also adds 'variant_id' (0-based, matches
+  df_preprocessed.csv's row order) and 'offset' columns, letting
+  regressor.py's --variant-meta-file group jittered copies of one variant
+  back together for evaluation (train on every offset as an independent
+  sample; average predictions per variant_id before scoring test folds).
 
 Examples
 --------
@@ -154,17 +160,24 @@ def parse_xlsx(path: str) -> pd.DataFrame:
 
 # ── Sequence extraction ────────────────────────────────────────────────────────
 
-def extract_window(genome: Seq, pos: int, ref: str, alt: str, window: int) -> tuple[str, str, int]:
-    """Return (ref_window, mut_window, edit_start) centered on pos (1-based).
+def extract_window(genome: Seq, pos: int, ref: str, alt: str, window: int,
+                    offset: int = 0) -> tuple[str, str, int]:
+    """Return (ref_window, mut_window, edit_start) centered on pos (1-based), shifted
+    by `offset` bp (jitter augmentation — see --jitter).
 
     Works for SNVs, insertions, and deletions.
-    The window is centered on the first base of the variant (VCF convention).
+    The window is centered on the first base of the variant (VCF convention),
+    then re-centered `offset` bp away — offset=0 reproduces the plain centered
+    window; offset>0 shifts the window downstream (the variant moves toward the
+    window's start); offset<0 shifts it upstream (variant moves toward the end).
     ref_window always spans `window` bases (or fewer at chromosome ends).
     mut_window replaces the ref allele with the alt allele, so its length
     may differ from ref_window for indels.
     edit_start is the 0-based index of the first allele base within the
     window — identical for ref_window and mut_window since both are built
     from the same left context.
+    Raises ValueError (like the reference-mismatch check) if `offset` is large
+    enough to push the variant entirely outside the window.
     """
     ind = pos - 1  # 0-based index of first ref base
     actual = str(genome[ind: ind + len(ref)]).upper()
@@ -172,13 +185,18 @@ def extract_window(genome: Seq, pos: int, ref: str, alt: str, window: int) -> tu
         raise ValueError(
             f"Reference mismatch at pos={pos}: expected {ref!r}, genome has {actual!r}"
         )
-    # Center the window on the midpoint of the ref allele
-    center = ind + len(ref) // 2
+    # Center the window on the midpoint of the ref allele, then apply the jitter offset
+    center = ind + len(ref) // 2 + offset
     start  = max(0, center - window // 2)
     end    = min(center + window // 2, len(genome))
     ref_window = str(genome[start:end])
     target_len = len(ref_window)
     edit_start = ind - start
+    if not (0 <= edit_start < target_len):
+        raise ValueError(
+            f"offset={offset} at pos={pos} pushes the variant outside the window "
+            f"(edit_start={edit_start}, window length={target_len})"
+        )
 
     # Build mut_window and adjust trailing context so it matches ref_window length.
     # Insertion (len(alt) > len(ref)): naive mut_window is too long — trim the right end.
@@ -238,6 +256,17 @@ def main():
     parser.add_argument("--prefix", default="",
                         help="Optional prefix for output filenames (e.g. 'chr18_' → "
                              "'chr18_ref_seq_DNA_forward.npy').")
+    parser.add_argument("--jitter", type=int, nargs="+", default=None, metavar="BP",
+                        help="Jitter augmentation: one or more bp offsets (e.g. -1000 -500 0 "
+                             "500 1000) at which to re-center the window around each variant, "
+                             "in addition to the plain centered window. Each (variant, offset) "
+                             "pair becomes its own row, so N variants x K offsets produce up to "
+                             "N*K rows (offsets that push the variant off the window edge are "
+                             "skipped and logged, like a reference mismatch). variant_meta.csv "
+                             "gets 'variant_id' (0-based, matches df_preprocessed.csv's row "
+                             "order) and 'offset' columns so downstream training code can group "
+                             "jittered copies back to their source variant. Omit for the original "
+                             "single-row-per-variant behavior (offset=0 only).")
 
     args = parser.parse_args()
 
@@ -276,22 +305,29 @@ def main():
         genome = fetch_genome(args.accession)
 
     # ── Build windows ──────────────────────────────────────────────────────────
+    offsets = args.jitter if args.jitter else [0]
     ref_seqs, mut_seqs, meta_rows = [], [], []
     skipped = 0
     for i, row in variants.iterrows():
-        try:
-            ref_w, mut_w, edit_start = extract_window(genome, row["pos"], row["ref"], row["alt"], args.window)
-            ref_seqs.append(ref_w)
-            mut_seqs.append(mut_w)
-            meta_rows.append({"pos": row["pos"], "ref": row["ref"], "alt": row["alt"], "edit_start": edit_start})
-        except ValueError as e:
-            print(f"  SKIP variant {i} (pos={row['pos']}): {e}")
-            skipped += 1
+        for offset in offsets:
+            try:
+                ref_w, mut_w, edit_start = extract_window(
+                    genome, row["pos"], row["ref"], row["alt"], args.window, offset=offset,
+                )
+                ref_seqs.append(ref_w)
+                mut_seqs.append(mut_w)
+                meta_rows.append({
+                    "variant_id": i, "offset": offset,
+                    "pos": row["pos"], "ref": row["ref"], "alt": row["alt"], "edit_start": edit_start,
+                })
+            except ValueError as e:
+                print(f"  SKIP variant {i} (pos={row['pos']}, offset={offset}): {e}")
+                skipped += 1
 
     if not ref_seqs:
         sys.exit("ERROR: no variants successfully processed")
     if skipped:
-        print(f"  Skipped {skipped} variants due to reference mismatch")
+        print(f"  Skipped {skipped} (variant, offset) pairs due to reference mismatch or out-of-window offset")
 
     # ── Save ───────────────────────────────────────────────────────────────────
     from datetime import datetime

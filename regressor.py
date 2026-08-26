@@ -241,15 +241,35 @@ def load_data_dna(
     layer: str = None,
     pooling: str = None,
     downstream_k: str = None,
+    variant_meta_file: str = None,
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """
     DNA path: loads strand embeddings from emb directory.
       strand='forward'  → forward only
       strand='reverse'  → reverse only
       use_reverse=True  → forward + reverse concatenated
+
+    variant_meta_file: the variant_meta.csv written by prepare_dataset.py's
+    --jitter augmentation (needs a 'variant_id' column, 0-based, matching
+    path_to_df's row order). When given, df is expanded from one row per
+    variant to one row per (variant, offset) — same row count as the
+    jittered embeddings — with an added '_variant_id' column so nested_cv
+    can group jittered copies back together when scoring test folds.
+    Omit for the original one-row-per-variant behavior.
     """
     sep = "\t" if path_to_df.endswith(".tsv") else ","
     df  = pd.read_csv(path_to_df, sep=sep)
+
+    if variant_meta_file:
+        meta = pd.read_csv(variant_meta_file)
+        if "variant_id" not in meta.columns:
+            raise ValueError(f"{variant_meta_file} has no 'variant_id' column — was it written "
+                              "by prepare_dataset.py --jitter?")
+        variant_id = meta["variant_id"].to_numpy()
+        df = df.iloc[variant_id].reset_index(drop=True)
+        df["_variant_id"] = variant_id
+        logging.info(f"  Expanded df to {len(df)} rows via variant_meta_file "
+                     f"({len(np.unique(variant_id))} unique variants)")
 
     if use_reverse:
         logging.info("Loading forward-strand embeddings:")
@@ -284,6 +304,17 @@ def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 _spearman_scorer = make_scorer(_safe_corr)
+
+
+def _aggregate_by_variant(y_true: np.ndarray, y_pred: np.ndarray,
+                           variant_id: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Average y_true/y_pred across jittered copies sharing the same variant_id, so
+    --jitter's (variant, offset) rows are scored once per variant, not once per offset.
+    y_true is also averaged (rather than just taken once) as a robustness no-op — all
+    copies of a variant carry the same label, so this doesn't change the value."""
+    tmp = pd.DataFrame({"vid": variant_id, "y_true": y_true, "y_pred": y_pred})
+    agg = tmp.groupby("vid", sort=False).mean()
+    return agg["y_true"].to_numpy(), agg["y_pred"].to_numpy()
 
 
 def _best_params_repr(model_name: str, gs: GridSearchCV, best_pipe: Pipeline, dr_mode: str = None) -> str:
@@ -322,8 +353,14 @@ def simple_cv(
     model_name: str,
     pca_components: int = None,
     dr_mode: str = None,
+    variant_id: np.ndarray = None,
 ) -> tuple[list[dict], object]:
-    """2-fold group cross-validation (no inner loop) for when only 2 groups exist."""
+    """2-fold group cross-validation (no inner loop) for when only 2 groups exist.
+
+    variant_id (optional, from --jitter): every jittered (variant, offset) row is
+    still an independent training sample, but test predictions are averaged per
+    variant_id before scoring — see nested_cv's docstring for why.
+    """
     cv = GroupKFold(n_splits=2)
     fold_metrics = []
     best_model = None
@@ -336,10 +373,14 @@ def simple_cv(
         y_train_pred = pipe.predict(X[tr])
         y_test_pred  = pipe.predict(X[te])
 
+        y_te_true, y_te_pred = y[te], y_test_pred
+        if variant_id is not None:
+            y_te_true, y_te_pred = _aggregate_by_variant(y_te_true, y_te_pred, variant_id[te])
+
         train_corr = _safe_corr(y[tr], y_train_pred)
-        test_corr  = _safe_corr(y[te], y_test_pred)
-        test_mse   = mean_squared_error(y[te], y_test_pred)
-        test_mae   = mean_absolute_error(y[te], y_test_pred)
+        test_corr  = _safe_corr(y_te_true, y_te_pred)
+        test_mse   = mean_squared_error(y_te_true, y_te_pred)
+        test_mae   = mean_absolute_error(y_te_true, y_te_pred)
         train_mse  = mean_squared_error(y[tr], y_train_pred)
         train_mae  = mean_absolute_error(y[tr], y_train_pred)
 
@@ -372,6 +413,7 @@ def nested_cv(
     inner_splits: int = 3,
     pca_components: int = None,
     dr_mode: str = None,
+    variant_id: np.ndarray = None,
 ) -> list[dict]:
     """
     Nested group K-Fold cross-validation.
@@ -380,6 +422,19 @@ def nested_cv(
       each outer test fold is never seen during inner loop or model fit.
     Inner loop (inner_splits folds): validation on the outer train split —
       reports inner CV metrics alongside the outer test metrics.
+
+    variant_id (optional, from --jitter augmentation): every jittered
+    (variant, offset) row is still fit as an independent training sample
+    (no change to model.fit calls below) — GroupKFold already keeps all of
+    one variant's jittered copies in the same fold since they share the
+    same `groups` value, so this can't leak across train/val/test. What
+    does change: outer-fold TEST predictions are averaged per variant_id
+    before scoring (mirroring test-time inference, where you'd average
+    predictions across offsets for one variant). Inner-loop validation
+    metrics used for hyperparameter selection (via GridSearchCV) remain
+    per-row/unaveraged — an accepted approximation, since properly
+    averaging inside GridSearchCV's own scoring would require replacing
+    its built-in CV machinery.
 
     Returns list of per-outer-fold dicts with both inner CV and outer test metrics.
     """
@@ -444,9 +499,13 @@ def nested_cv(
         train_mae  = mean_absolute_error(y_outer_tr, y_train_pred)
         train_corr = _safe_corr(y_outer_tr, y_train_pred)
 
-        test_mse  = mean_squared_error(y_outer_te, y_outer_pred)
-        test_mae  = mean_absolute_error(y_outer_te, y_outer_pred)
-        test_corr = _safe_corr(y_outer_te, y_outer_pred)
+        y_te_true, y_te_pred = y_outer_te, y_outer_pred
+        if variant_id is not None:
+            y_te_true, y_te_pred = _aggregate_by_variant(y_te_true, y_te_pred, variant_id[outer_te])
+
+        test_mse  = mean_squared_error(y_te_true, y_te_pred)
+        test_mae  = mean_absolute_error(y_te_true, y_te_pred)
+        test_corr = _safe_corr(y_te_true, y_te_pred)
 
         best_params_str = f" | best={_best_params_repr(model_name, gs, best_pipe, dr_mode=dr_mode)}" if param_grid else ""
         logging.info(
@@ -590,16 +649,19 @@ def run_single(
                          f"Available columns: {list(df.columns)}")
     groups = df[fold_by].to_numpy()
     y      = df["Function Score"].to_numpy()
+    variant_id = df["_variant_id"].to_numpy() if "_variant_id" in df.columns else None
     n_groups = len(np.unique(groups))
     logging.info(f"Grouping by: '{fold_by}' ({n_groups} unique groups)")
 
     if n_groups == 2:
         fold_metrics, best_model = simple_cv(emb, y, groups, model_name=model_name,
-                                             pca_components=pca_components, dr_mode=dr_mode)
+                                             pca_components=pca_components, dr_mode=dr_mode,
+                                             variant_id=variant_id)
     else:
         fold_metrics, best_model = nested_cv(emb, y, groups, model_name=model_name,
                                              outer_splits=outer_splits, inner_splits=inner_splits,
-                                             pca_components=pca_components, dr_mode=dr_mode)
+                                             pca_components=pca_components, dr_mode=dr_mode,
+                                             variant_id=variant_id)
 
     if model_dir is not None and best_model is not None:
         model_dir = Path(model_dir)
@@ -630,53 +692,69 @@ def main(args):
 
     results = []
 
+    regime_label = "delta" if args.delta else "concat"
+
     if args.emb_mode == "rna":
         if not args.emb:
             raise ValueError("--emb is required for --emb_mode rna")
         df, emb = load_data_rna(args.df, args.emb)
+
+        for model_name in args.models:
+            tag = f"{model_name} | {regime_label} | {args.strand}"
+            results.append(run_single(emb, df, model_name=model_name,
+                                      tag=tag, pca_components=args.pca,
+                                      model_dir=args.model_dir, fold_by=args.fold_by))
+        results.append(run_single(emb, df, model_name="Dummy",
+                                  tag="Dummy (mean baseline)", pca_components=None,
+                                  model_dir=None, fold_by=args.fold_by))
+
     elif args.emb_mode == "dna":
         if not args.emb:
             raise ValueError("--emb is required for --emb_mode dna")
         use_reverse = args.strand == "both"
         strand = "forward" if args.strand != "reverse" else "reverse"
-        regime = "delta" if args.delta else "concat"
-        df, emb = load_data_dna(args.df, args.emb, args.delta, use_reverse=use_reverse,
-                                 strand=strand, layer=args.layer, pooling=args.pooling,
-                                 downstream_k=args.downstream_k)
+
+        for k in args.downstream_k:
+            k_label = k  # "full", "all", or an integer string — used verbatim in the tag
+            downstream_k = None if k == "full" else k
+            logging.info(f"\n### downstream_k={k_label} ###")
+            df, emb = load_data_dna(args.df, args.emb, args.delta, use_reverse=use_reverse,
+                                     strand=strand, layer=args.layer, pooling=args.pooling,
+                                     downstream_k=downstream_k,
+                                     variant_meta_file=args.variant_meta_file)
+
+            for model_name in args.models:
+                if model_name == "GaussianProcess":
+                    # Run GP with three DR options: PCA, PLS (supervised), and none
+                    gp_dr_options = [("pca", "pca"), ("pls", "pls"), ("none", None)]
+                    if not args.pca:
+                        gp_dr_options = [("none", None)]  # no components specified — only plain GP
+                    for dr_label, dr_mode in gp_dr_options:
+                        tag = f"GaussianProcess-{dr_label} | {regime_label} | {args.strand} | {k_label}"
+                        results.append(run_single(emb, df, model_name="GaussianProcess",
+                                                  tag=tag, pca_components=args.pca,
+                                                  model_dir=args.model_dir, fold_by=args.fold_by,
+                                                  dr_mode=dr_mode))
+                else:
+                    tag = f"{model_name} | {regime_label} | {args.strand} | {k_label}"
+                    results.append(run_single(emb, df, model_name=model_name,
+                                              tag=tag, pca_components=args.pca,
+                                              model_dir=args.model_dir, fold_by=args.fold_by))
+            results.append(run_single(emb, df, model_name="Dummy",
+                                      tag=f"Dummy (mean baseline) | {k_label}", pca_components=None,
+                                      model_dir=None, fold_by=args.fold_by))
     else:
         raise ValueError(f"Unknown emb_mode: {args.emb_mode}")
-
-    regime_label = "delta" if args.delta else "concat"
-    for model_name in args.models:
-        if model_name == "GaussianProcess":
-            # Run GP with three DR options: PCA, PLS (supervised), and none
-            gp_dr_options = [("pca", "pca"), ("pls", "pls"), ("none", None)]
-            if not args.pca:
-                gp_dr_options = [("none", None)]  # no components specified — only plain GP
-            for dr_label, dr_mode in gp_dr_options:
-                tag = f"GaussianProcess-{dr_label} | {regime_label} | {args.strand}"
-                results.append(run_single(emb, df, model_name="GaussianProcess",
-                                          tag=tag, pca_components=args.pca,
-                                          model_dir=args.model_dir, fold_by=args.fold_by,
-                                          dr_mode=dr_mode))
-        else:
-            tag = f"{model_name} | {regime_label} | {args.strand}"
-            results.append(run_single(emb, df, model_name=model_name,
-                                      tag=tag, pca_components=args.pca,
-                                      model_dir=args.model_dir, fold_by=args.fold_by))
-    results.append(run_single(emb, df, model_name="Dummy",
-                              tag="Dummy (mean baseline)", pca_components=None,
-                              model_dir=None, fold_by=args.fold_by))
 
     # ── Summary table ──────────────────────────────────────────────────────
     logging.info("\n" + "=" * 60)
     logging.info("  SUMMARY")
     logging.info("=" * 60)
-    logging.info(f"{'Tag':<35} {'train_r':>8} {'stdev':>7} {'val_r':>7} {'stdev':>7} {'test_r':>7} {'stdev':>7} {'test_mse':>9} {'stdev':>7} {'test_mae':>9} {'stdev':>7}")
+    logging.info(f"{'Tag':<48} {'train_r':>8} {'stdev':>7} {'val_r':>7} {'stdev':>7} {'test_r':>7} {'stdev':>7} {'test_mse':>9} {'stdev':>7} {'test_mae':>9} {'stdev':>7}")
     logging.info("-" * 115)
     for m in results:
         logging.info(
-            f"{m['tag']:<35} "
+            f"{m['tag']:<48} "
             f"{m['train_corr']:>8.4f} {m['train_corr_std']:>7.4f} "
             f"{m['val_corr']:>7.4f} {m['val_corr_std']:>7.4f} "
             f"{m['test_corr']:>7.4f} {m['test_corr_std']:>7.4f} "
@@ -723,11 +801,20 @@ if __name__ == "__main__":
     parser.add_argument("--pooling", choices=["average", "last"], default=None,
                         help="[DNA mode] Pooling mode: 'average' or 'last'. Required when the "
                              "embedding directory contains multiple pooling modes.")
-    parser.add_argument("--downstream-k", default=None, metavar="K",
-                        help="[DNA mode] Select a --pool-region downstream variant written by "
-                             "extract_embeddings.py: an integer (e.g. 0, 32, 128, 512) or 'all'. "
-                             "Omit to load the plain full-sequence embeddings instead. Required "
-                             "when the embedding directory contains both, or multiple k's.")
+    parser.add_argument("--downstream-k", nargs="+", default=["full"], metavar="K",
+                        help="[DNA mode] One or more --pool-region downstream variants written by "
+                             "extract_embeddings.py to compare in this run: 'full' (default) for "
+                             "the plain full-sequence embeddings, an integer (e.g. 0, 32, 128, "
+                             "512), or 'all'. Each value is loaded and run through every model in "
+                             "--models, labeled in the tag/results (e.g. --downstream-k full 0 32 "
+                             "128 512 all compares all six in one run).")
+    parser.add_argument("--variant-meta-file", default=None, metavar="FILE",
+                        help="[DNA mode] variant_meta.csv written by prepare_dataset.py --jitter "
+                             "(needs a 'variant_id' column). Expands --df to one row per "
+                             "(variant, offset) matching the jittered embeddings, trains on every "
+                             "offset as an independent sample, and averages test-fold predictions "
+                             "per variant before scoring. Omit for the original one-row-per-variant "
+                             "behavior.")
 
     parser.add_argument("--fold_by", choices=["Protein Annotation", "merged_region"],
                         default="Protein Annotation",
@@ -753,11 +840,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if "all" in args.models:
         args.models = MODELS
-    if args.downstream_k is not None and args.downstream_k != "all":
-        try:
-            int(args.downstream_k)
-        except ValueError:
-            parser.error(f"--downstream-k must be 'all' or an integer, got {args.downstream_k!r}")
+    for k in args.downstream_k:
+        if k not in ("full", "all"):
+            try:
+                int(k)
+            except ValueError:
+                parser.error(f"--downstream-k values must be 'full', 'all', or an integer, got {k!r}")
     main(args)
 
 

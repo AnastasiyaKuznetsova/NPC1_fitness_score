@@ -161,18 +161,30 @@ def main():
     parser.add_argument("--model_dir", default="saved_models",
                         help="Directory to save the best model per run as a .joblib file. "
                              "Default: saved_models.")
+    parser.add_argument("--models", nargs="+", default=["all"],
+                        choices=[m for m in MODELS if m != "Dummy"] + ["all"],
+                        help="Which non-Dummy models to sweep (default: all). Dummy is always "
+                             "included as the baseline regardless of this flag. E.g. to skip "
+                             "GaussianProcess: --models Ridge Lasso ElasticNet KernelRidge SVR "
+                             "PLS kNN RandomForest DecisionTree")
+    parser.add_argument("--emb-types", nargs="+", default=["delta", "concat"],
+                        choices=["delta", "concat"],
+                        help="Which embedding regimes to sweep (default: both). Use "
+                             "'--emb-types delta' to skip concat entirely.")
     args = parser.parse_args()
+    if "all" in args.models:
+        args.models = [m for m in MODELS if m != "Dummy"]
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     emb_dir = Path(args.emb)
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    non_dummy_models = [m for m in MODELS if m != "Dummy"]
     model_configs = [
         {"model_name": model_name, "delta": delta, "emb_type": "delta" if delta else "concat"}
-        for model_name in non_dummy_models
-        for delta in [True, False]
+        for model_name in args.models
+        for delta in ([True] if args.emb_types == ["delta"] else
+                      [False] if args.emb_types == ["concat"] else [True, False])
     ] + [{"model_name": "Dummy", "delta": True, "emb_type": "none"}]
 
     strand_configs = {
