@@ -10,7 +10,7 @@ from scipy.stats import spearmanr
 model = Evo2("evo2_7b")
 # Let's do for forward
 var_seqs = np.load('output/mut_seq_DNA_forward_20260825.npy')
-ref_seqs = np.load('ref_seq_DNA_forward_20260825.npy')
+ref_seqs = np.load('output/ref_seq_DNA_forward_20260825.npy')
 df = pd.read_csv('output/df_preprocessed.csv')
 
 print(f'Scoring likelihoods of {len(ref_seqs)} reference sequences with Evo 2...')
