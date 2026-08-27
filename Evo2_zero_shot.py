@@ -20,4 +20,4 @@ print(f'Scoring likelihoods of {len(var_seqs)} variant sequences with Evo 2...')
 var_scores = model.score_sequences(var_seqs)
 
 delta_scores = np.array(var_scores) - np.array(ref_scores)
-print(spearmanr(df['Function score'], delta_scores))
+print(spearmanr(df['Function Score'], delta_scores))
