@@ -9,11 +9,16 @@ MODEL="evo2_7b"
 SIF="sif/evo2.sif"
 LOGDIR="logs_extract_emb_7B_1M_cw"
 
+# Reduces CUDA allocator fragmentation (PyTorch's own suggestion on OOM
+# messages that show large "reserved but unallocated" memory) — lets large
+# allocations reuse fragmented reserved blocks instead of failing outright.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # Folder written by a single prepare_dataset.py run (output/<YYYYMMDD_HHMMSS>/).
 # extract_embeddings_Evo2.py requires --ref-file/--mut-file whose filename
 # contains a "<N>bp" token (it no longer has a usable stale default), so this
 # must point at a real prepare_dataset.py output directory before submitting.
-DATASET_DIR="output/20260828_125426"
+DATASET_DIR="output/20260828_154653"
 
 mkdir -p "$LOGDIR"
 
@@ -73,7 +78,9 @@ for strand in "${STRANDS[@]}"; do
             logfile="${LOGDIR}/${MODEL}_${strand}_${emb_type}_${chunk_tag}.log"
             echo "Running: strand=${strand} emb-type=${emb_type} layers=${chunk[*]}"
 
-            apptainer exec --nv "$SIF" python "extract_embeddings_Evo2.py" \
+            apptainer exec --nv \
+                --env PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
+                "$SIF" python "extract_embeddings_Evo2.py" \
                 --model "$MODEL" \
                 --layer "${chunk[@]}" \
                 --strand "$strand" \
