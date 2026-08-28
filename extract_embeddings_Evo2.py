@@ -10,7 +10,6 @@ Model / layers
 Input
   --ref-file       Reference sequences .npy. Default: output/ref_seq_DNA_{strand}.npy
   --mut-file       Mutant sequences .npy.    Default: output/mut_seq_DNA_{strand}.npy
-  --seq-type       DNA or RNA — only affects the output filename label. Default: DNA.
   --strand         forward or reverse — selects the default input files and labels
                     output. Default: forward.
   --batch-size     Sequences per forward pass. Default: 1.
@@ -40,7 +39,7 @@ Output
   ref_seq_DNA_forward_8192bp.npy or variant_meta_8192bp.csv — not a fixed
   default, so the --ref-file/--variant-meta-file name must contain a
   "<N>bp" token).
-  One {ref_seq,mut_seq}_{seq_type}_L{layer}_{emb_type}_{strand}[_ds{k}].npy
+  One {ref_seq,mut_seq}_L{layer}_{emb_type}_{strand}[_ds{k}].npy
   per layer (and per k, if swept), shape (N, D). model_family/params aren't
   repeated in the filename since they're already in the folder name.
 """
@@ -76,9 +75,9 @@ def layer_index(layer: str) -> str:
     return m.group(1) if m else layer
 
 
-def build_filename(seq_type: str, layer: str, mode: str, strand: str, region_suffix: str = "") -> str:
+def build_filename(layer: str, mode: str, strand: str, region_suffix: str = "") -> str:
     suffix = f"_{region_suffix}" if region_suffix else ""
-    return f"{seq_type}_L{layer_index(layer)}_{mode}_{strand}{suffix}.npy"
+    return f"L{layer_index(layer)}_{mode}_{strand}{suffix}.npy"
 
 
 def parse_context_window(path: str) -> str:
@@ -171,8 +170,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer", nargs="+", default=[DEFAULT_LAYER_NAME],
                         help="One or more layer names to extract. All layers are extracted in a "
                              f"single forward pass. (default: {DEFAULT_LAYER_NAME}).")
-    parser.add_argument("--seq-type", default="DNA", choices=["DNA", "RNA"],
-                        help="Sequence type label in output filename (default: DNA)")
     parser.add_argument("--strand", default="forward", choices=["forward", "reverse"],
                         help="Strand direction — selects input file and labels output (default: forward)")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
@@ -220,7 +217,6 @@ def extract_embeddings(
     df: str,
     emb_type: str,
     layers: list[str],
-    seq_type: str,
     strand: str,
     out_dir: str,
     batch_size: int = BATCH_SIZE,
@@ -262,7 +258,7 @@ def extract_embeddings(
         for r in regions:
             combined = np.concatenate(all_pooled[(layer, r)], axis=0)
             region_suffix = "" if r is None else f"ds{r}"
-            fname = build_filename(seq_type, layer, emb_type, strand, region_suffix)
+            fname = build_filename(layer, emb_type, strand, region_suffix)
             out_path = os.path.join(out_dir, f"{df}_{fname}")
             np.save(out_path, combined)
             print(f"Saved {emb_type} embeddings layer {layer_index(layer)} region={region_suffix or 'full'}: "
@@ -317,7 +313,6 @@ if __name__ == "__main__":
             df=df,
             emb_type=args.emb_type,
             layers=layers,
-            seq_type=args.seq_type,
             out_dir=out_dir,
             strand=args.strand,
             batch_size=args.batch_size,
