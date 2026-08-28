@@ -35,8 +35,14 @@ Pooling
                     Default: output/variant_meta.csv.
 
 Output
-  One embeddings/{ref_seq,mut_seq}_{seq_type}_{model_family}_{params}_L{layer}_
-  {emb_type}_{strand}[_ds{k}].npy per layer (and per k, if swept), shape (N, D).
+  Saved under a folder named {model_family}_{params}_{context_window}_emb, e.g.
+  Evo2_7B_8192bp_emb/ (context_window is parsed from the input filename — e.g.
+  ref_seq_DNA_forward_8192bp.npy or variant_meta_8192bp.csv — not a fixed
+  default, so the --ref-file/--variant-meta-file name must contain a
+  "<N>bp" token).
+  One {ref_seq,mut_seq}_{seq_type}_L{layer}_{emb_type}_{strand}[_ds{k}].npy
+  per layer (and per k, if swept), shape (N, D). model_family/params aren't
+  repeated in the filename since they're already in the folder name.
 """
 
 import argparse
@@ -70,10 +76,22 @@ def layer_index(layer: str) -> str:
     return m.group(1) if m else layer
 
 
-def build_filename(seq_type: str, model_family: str, params: str, layer: str, mode: str, strand: str,
-                    region_suffix: str = "") -> str:
+def build_filename(seq_type: str, layer: str, mode: str, strand: str, region_suffix: str = "") -> str:
     suffix = f"_{region_suffix}" if region_suffix else ""
-    return f"{seq_type}_{model_family}_{params}_L{layer_index(layer)}_{mode}_{strand}{suffix}.npy"
+    return f"{seq_type}_L{layer_index(layer)}_{mode}_{strand}{suffix}.npy"
+
+
+def parse_context_window(path: str) -> str:
+    """Extract the '<N>bp' context-window token from a filename written by
+    prepare_dataset.py (e.g. ref_seq_DNA_forward_8192bp.npy or
+    variant_meta_8192bp.csv), for use in the output folder name."""
+    m = re.search(r"(\d+bp)", os.path.basename(path))
+    if not m:
+        raise ValueError(
+            f"Could not find a '<N>bp' context-window token in filename {path!r}. "
+            "Expected a name like '..._8192bp.npy' as written by prepare_dataset.py."
+        )
+    return m.group(1)
 
 
 def pool(hidden: torch.Tensor, lengths: list[int], emb_type: str) -> torch.Tensor:
@@ -204,8 +222,7 @@ def extract_embeddings(
     layers: list[str],
     seq_type: str,
     strand: str,
-    model_family: str,
-    params: str,
+    out_dir: str,
     batch_size: int = BATCH_SIZE,
     pad_id: int = 0,
     pool_region: str = "full",
@@ -214,9 +231,10 @@ def extract_embeddings(
 ) -> None:
     """
     Extract embeddings from one or more layers in a single forward pass per batch.
-    Saves one .npy file per layer (and, for pool_region="downstream", per k in downstream_ks).
+    Saves one .npy file per layer (and, for pool_region="downstream", per k in downstream_ks)
+    into out_dir (named {model_family}_{params}_{context_window}_emb by the caller).
     """
-    os.makedirs("embeddings", exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     regions = downstream_ks if pool_region == "downstream" else [None]  # None = full-sequence pool()
     all_pooled = {(layer, r): [] for layer in layers for r in regions}
 
@@ -244,10 +262,11 @@ def extract_embeddings(
         for r in regions:
             combined = np.concatenate(all_pooled[(layer, r)], axis=0)
             region_suffix = "" if r is None else f"ds{r}"
-            fname = build_filename(seq_type, model_family, params, layer, emb_type, strand, region_suffix)
-            np.save(f"embeddings/{df}_{fname}", combined)
+            fname = build_filename(seq_type, layer, emb_type, strand, region_suffix)
+            out_path = os.path.join(out_dir, f"{df}_{fname}")
+            np.save(out_path, combined)
             print(f"Saved {emb_type} embeddings layer {layer_index(layer)} region={region_suffix or 'full'}: "
-                  f"{combined.shape} -> {df}_{fname}")
+                  f"{combined.shape} -> {out_path}")
 
 
 if __name__ == "__main__":
@@ -261,6 +280,9 @@ if __name__ == "__main__":
         "ref_seq": args.ref_file or f"output/ref_seq_DNA_{args.strand}.npy",
         "mut_seq": args.mut_file or f"output/mut_seq_DNA_{args.strand}.npy",
     }
+
+    context_window = parse_context_window(input_files["ref_seq"])
+    out_dir = f"{model_family}_{params}_{context_window}_emb"
 
     edit_start = ref_len = alt_len = None
     if args.pool_region == "downstream":
@@ -296,8 +318,7 @@ if __name__ == "__main__":
             emb_type=args.emb_type,
             layers=layers,
             seq_type=args.seq_type,
-            model_family=model_family,
-            params=params,
+            out_dir=out_dir,
             strand=args.strand,
             batch_size=args.batch_size,
             pad_id=pad_id,
