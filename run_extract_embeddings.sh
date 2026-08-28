@@ -5,9 +5,9 @@
 
 set -uoe pipefail
 
-MODEL="evo2_40b"
-SIF="evo2.sif"
-LOGDIR="logs_extract_emb_40B"
+MODEL="evo2_7b"
+SIF="sif/evo2.sif"
+LOGDIR="logs_extract_emb_7B_1M_cw"
 
 mkdir -p "$LOGDIR"
 
@@ -16,7 +16,7 @@ if [ "$MODEL" == "evo2_7b" ]; then
 elif [ "$MODEL" == "evo2_40b" ]; then
     LAYERS=(40 41 42 43 44 45 46 47 48 49)
 else
-    LAYERS=(10 12 13 14 15 16 17 18 19 20 21 22 23 24)
+    LAYERS=(15 16 17 18 19 20 21 22 23 24)
 fi
 
 # Build layer name list: blocks.N.mlp.l3 for each N
@@ -36,7 +36,6 @@ for strand in "${STRANDS[@]}"; do
         apptainer exec --nv "$SIF" python "extract_embeddings.py" \
             --model "$MODEL" \
             --layer "${LAYER_NAMES[@]}" \
-            --seq-type DNA \
             --strand "$strand" \
             --emb-type "$emb_type" \
             > "$logfile" 2>&1
