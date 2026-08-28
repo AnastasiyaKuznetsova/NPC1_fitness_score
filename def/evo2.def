@@ -1,0 +1,16 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.04-py3
+
+%post
+    apt-get update && apt-get install -y git python3-pip python3-tomli && rm -rf /var/lib/apt/lists/*
+    pip install evo2
+    pip uninstall -y transformer-engine transformer-engine-torch
+    unset PIP_CONSTRAINT
+    pip install transformer_engine[pytorch]==1.13.0 --no-build-isolation
+
+%environment
+    export WORKDIR=/workdir
+
+%runscript
+    cd /workdir
+    exec "$@"
