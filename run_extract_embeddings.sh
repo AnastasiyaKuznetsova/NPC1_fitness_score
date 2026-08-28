@@ -37,6 +37,14 @@ for layer in "${LAYERS[@]}"; do
     LAYER_NAMES+=("blocks.${layer}.mlp.l3")
 done
 
+# Requesting many layers in one forward pass makes vortex's pipeline-parallel
+# sharding hold several full (batch, seq_len, hidden_dim) hook outputs on the
+# same one or two GPUs at once (contiguous blocks -> contiguous devices), which
+# OOMs at a ~1M bp context regardless of total GPU count. Running fewer layers
+# per forward pass trades wall-clock time (one extra forward pass per chunk)
+# for a much smaller peak memory footprint per GPU. Lower to 1 if 2 still OOMs.
+LAYERS_PER_FORWARD=2
+
 STRANDS=(forward reverse)
 EMB_TYPES=(average last)
 
@@ -57,22 +65,28 @@ for strand in "${STRANDS[@]}"; do
     mut_file="${mut_matches[0]}"
 
     for emb_type in "${EMB_TYPES[@]}"; do
-        logfile="${LOGDIR}/${MODEL}_${strand}_${emb_type}.log"
-        echo "Running: strand=${strand} emb-type=${emb_type} layers=${LAYER_NAMES[*]}"
+        for ((chunk_start=0; chunk_start<${#LAYER_NAMES[@]}; chunk_start+=LAYERS_PER_FORWARD)); do
+            chunk=("${LAYER_NAMES[@]:chunk_start:LAYERS_PER_FORWARD}")
+            chunk_tag=$(printf '%s+' "${chunk[@]}")
+            chunk_tag=${chunk_tag//./}
+            chunk_tag=${chunk_tag%+}
+            logfile="${LOGDIR}/${MODEL}_${strand}_${emb_type}_${chunk_tag}.log"
+            echo "Running: strand=${strand} emb-type=${emb_type} layers=${chunk[*]}"
 
-        apptainer exec --nv "$SIF" python "extract_embeddings_Evo2.py" \
-            --model "$MODEL" \
-            --layer "${LAYER_NAMES[@]}" \
-            --strand "$strand" \
-            --emb-type "$emb_type" \
-            --ref-file "$ref_file" \
-            --mut-file "$mut_file" \
-            > "$logfile" 2>&1
+            apptainer exec --nv "$SIF" python "extract_embeddings_Evo2.py" \
+                --model "$MODEL" \
+                --layer "${chunk[@]}" \
+                --strand "$strand" \
+                --emb-type "$emb_type" \
+                --ref-file "$ref_file" \
+                --mut-file "$mut_file" \
+                > "$logfile" 2>&1
 
-        if [ $? -ne 0 ]; then
-            echo "  FAILED (see $logfile)"
-        else
-            echo "  done"
-        fi
+            if [ $? -ne 0 ]; then
+                echo "  FAILED (see $logfile)"
+            else
+                echo "  done"
+            fi
+        done
     done
 done
