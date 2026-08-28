@@ -12,7 +12,8 @@ Three input modes:
 For modes 2 & 3 the chromosome accession is resolved automatically via --accession
 (default: NC_000018.10 for chr18). Pass --accession for a different chromosome.
 
-Saves five files to --out_dir:
+Saves five files to a timestamped subdirectory of --out_dir
+(--out_dir/YYYYMMDD_HHMMSS/), created fresh on every run:
 
   Four sequence-window .npy arrays, shape (N,) of strings (or (N*K,) with
   --jitter — see below), row i is the same variant as row i of
@@ -35,25 +36,31 @@ Saves five files to --out_dir:
   back together for evaluation (train on every offset as an independent
   sample; average predictions per variant_id before scoring test folds).
 
+--window is required and is baked into every output filename as '<window>bp'
+(e.g. ref_seq_DNA_forward_8192bp.npy). If --jitter is used, the offsets are
+also baked in as '_jitter<off1>_<off2>...' (omitted by default). Each run
+gets its own --out_dir/YYYYMMDD_HHMMSS/ subdirectory.
+
 Examples
 --------
 # Original Excel workflow (unchanged):
-python prepare_dataset.py --xlsx data/NPC1_mut_fitness_scores.xlsx
+python prepare_dataset.py --xlsx data/NPC1_mut_fitness_scores.xlsx --window 8192
 
 # ClinVar 2-star TSV:
-python prepare_dataset.py --tsv data/npc1_2star_GRCh38.tsv
+python prepare_dataset.py --tsv data/npc1_2star_GRCh38.tsv --window 8192
 
 # Single variant from CLI:
-python prepare_dataset.py --coords chr18:25290796:A:T
+python prepare_dataset.py --coords chr18:25290796:A:T --window 8192
 
 # Multiple variants from CLI:
-python prepare_dataset.py --coords chr18:25290796:A:T chr18:25291000:G:C
+python prepare_dataset.py --coords chr18:25290796:A:T chr18:25291000:G:C --window 8192
 
 """
 
 import argparse
 import os
 import sys
+import time
 from io import StringIO
 from pathlib import Path
 
@@ -63,7 +70,6 @@ import requests
 from Bio import SeqIO
 from Bio.Seq import Seq
 
-WINDOW_SIZE = 8192
 OUTPUT_DIR = "output"
 
 # Default accession → used when fetching from NCBI
@@ -76,14 +82,23 @@ GENOME_URL_TEMPLATE = (
 
 # ── Genome loading ─────────────────────────────────────────────────────────────
 
-def fetch_genome(accession: str) -> Seq:
+def fetch_genome(accession: str, max_retries: int = 5) -> Seq:
     url = GENOME_URL_TEMPLATE.format(accession=accession)
     print(f"Fetching genome {accession} from NCBI ...")
-    response = requests.get(url, timeout=120)
-    response.raise_for_status()
-    record = SeqIO.read(StringIO(response.text), "fasta")
-    print(f"  Genome length: {len(record.seq):,} bp")
-    return record.seq
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, timeout=120)
+            response.raise_for_status()
+            record = SeqIO.read(StringIO(response.text), "fasta")
+            print(f"  Genome length: {len(record.seq):,} bp")
+            return record.seq
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            wait = 2 ** attempt
+            print(f"  Fetch attempt {attempt}/{max_retries} failed ({e}); retrying in {wait}s ...")
+            time.sleep(wait)
+    raise RuntimeError(f"Failed to fetch genome {accession} after {max_retries} attempts") from last_error
 
 
 def load_fasta(path: str) -> Seq:
@@ -250,9 +265,9 @@ def main():
     # Output
     parser.add_argument("--out_dir", default=OUTPUT_DIR,
                         help=f"Directory for output files. Default: {OUTPUT_DIR}")
-    parser.add_argument("--window", type=int, default=WINDOW_SIZE,
-                        help=f"Sequence window size in bp (centered on the variant). "
-                             f"Default: {WINDOW_SIZE}")
+    parser.add_argument("--window", type=int, required=True,
+                        help="Sequence window size in bp (centered on the variant). "
+                             "Required; saved into the output filenames as '<window>bp'.")
     parser.add_argument("--prefix", default="",
                         help="Optional prefix for output filenames (e.g. 'chr18_' → "
                              "'chr18_ref_seq_DNA_forward.npy').")
@@ -331,19 +346,23 @@ def main():
 
     # ── Save ───────────────────────────────────────────────────────────────────
     from datetime import datetime
-    out_dir = Path(args.out_dir)
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.out_dir) / timestamp_str
+    out_dir.mkdir(parents=True, exist_ok=True)
     p = args.prefix
-    date_str = datetime.now().strftime("%Y%m%d")
+    window_str = f"{args.window}bp"
+    jitter_str = f"_jitter{'_'.join(str(o) for o in args.jitter)}" if args.jitter else ""
+    tag = f"{window_str}{jitter_str}"
 
     ref_forward = np.array(ref_seqs)
     mut_forward = np.array(mut_seqs)
     ref_reverse = reverse_complement(ref_forward)
     mut_reverse = reverse_complement(mut_forward)
     for fname, arr in [
-        (f"{p}ref_seq_DNA_forward_{date_str}.npy", ref_forward),
-        (f"{p}ref_seq_DNA_reverse_{date_str}.npy", ref_reverse),
-        (f"{p}mut_seq_DNA_forward_{date_str}.npy", mut_forward),
-        (f"{p}mut_seq_DNA_reverse_{date_str}.npy", mut_reverse),
+        (f"{p}ref_seq_DNA_forward_{tag}.npy", ref_forward),
+        (f"{p}ref_seq_DNA_reverse_{tag}.npy", ref_reverse),
+        (f"{p}mut_seq_DNA_forward_{tag}.npy", mut_forward),
+        (f"{p}mut_seq_DNA_reverse_{tag}.npy", mut_reverse),
     ]:
         out_path = out_dir / fname
         np.save(out_path, arr)
@@ -352,7 +371,7 @@ def main():
     # Edit-position metadata, row-aligned with the four sequence arrays above.
     # Lets extract_embeddings.py's --pool-region downstream find where the
     # variant sits in each window without recomputing it.
-    meta_path = out_dir / f"{p}variant_meta_{date_str}.csv"
+    meta_path = out_dir / f"{p}variant_meta_{tag}.csv"
     pd.DataFrame(meta_rows).to_csv(meta_path, index=False)
     print(f"  Saved {len(meta_rows)} rows → {meta_path}")
 
