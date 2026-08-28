@@ -1,0 +1,39 @@
+Bootstrap: docker
+From: python:3.12-slim
+
+%post
+    set -e
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates
+    rm -rf /var/lib/apt/lists/*
+
+    pip install --no-cache-dir \
+        numpy==2.4.6 \
+        pandas==3.0.3 \
+        requests==2.34.2 \
+        biopython==1.87 \
+        openpyxl==3.1.5
+
+%environment
+    export LC_ALL=C.UTF-8
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec python3 "$@"
+
+%labels
+    Author akuznetsova@scripps.edu
+
+%help
+    Environment image for prepare_dataset.py (builds ref/mut DNA sequence
+    windows around NPC1 variants for Evo2 embedding). Provides numpy,
+    pandas, requests, biopython, and openpyxl — no project code or data is
+    baked into the image, so bind-mount the project directory at runtime.
+
+    Build:
+        apptainer build prepare_dataset.sif prepare_dataset.def
+
+    Run (from the Genomic_model directory, so prepare_dataset.py and your
+    data/output dirs are visible inside the container):
+        apptainer run --bind "$PWD":"$PWD" --pwd "$PWD" prepare_dataset.sif \
+            prepare_dataset.py --xlsx data/NPC1_mut_fitness_scores.xlsx --window 8192
