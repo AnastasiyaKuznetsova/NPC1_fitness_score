@@ -2,7 +2,6 @@
 *.pem
 /evo2
 /*logs*
-/*B*
 .vscode/
 __pycache__/
 .rocketride/
