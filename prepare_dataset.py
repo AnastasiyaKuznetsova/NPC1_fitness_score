@@ -220,9 +220,12 @@ def extract_window(genome: Seq, pos: int, ref: str, alt: str, window: int,
     mut_end    = min(end - size_delta, len(genome))
     mut_window = str(genome[start:ind]) + alt + str(genome[ind + len(ref):mut_end])
     mut_window = mut_window[:target_len]  # trim overshoot
-    # Deletions near a chromosome end leave mut_window short — pad with Ns rather than crash.
+    # Deletions near a chromosome end leave mut_window short — skip rather than pad with Ns.
     if len(mut_window) < target_len:
-        mut_window = mut_window + "N" * (target_len - len(mut_window))
+        raise ValueError(
+            f"pos={pos}: deletion near chromosome end leaves mut_window short "
+            f"({len(mut_window)} < {target_len}); skipping rather than padding with Ns"
+        )
     if len(mut_window) != target_len:
         raise ValueError(
             f"Window length mismatch at pos={pos}: ref={target_len}, mut={len(mut_window)}"
