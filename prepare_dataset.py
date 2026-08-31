@@ -303,7 +303,7 @@ def main():
         variants = parse_tsv(args.tsv)
     else:
         print(f"Variants from CLI: {args.coords}")
-        variants = parse_coords(args.coords)
+        variants = parse_coords(args.coords) # type: ignore
 
     print(f"Total variants to process: {len(variants)}")
 
