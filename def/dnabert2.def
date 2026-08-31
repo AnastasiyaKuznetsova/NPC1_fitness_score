@@ -61,10 +61,10 @@ From: nvidia/cuda:11.7.1-cudnn8-devel-ubuntu22.04
 
 %test
     python3.10 - <<'PY'
-    import torch, transformers, einops
-    print("torch:", torch.__version__, "| CUDA available:", torch.cuda.is_available())
-    print("transformers:", transformers.__version__)
-    PY
+import torch, transformers, einops
+print("torch:", torch.__version__, "| CUDA available:", torch.cuda.is_available())
+print("transformers:", transformers.__version__)
+PY
 
 %labels
     Application DNABERT-2
