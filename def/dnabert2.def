@@ -1,0 +1,92 @@
+Bootstrap: docker
+From: nvidia/cuda:11.7.1-cudnn8-devel-ubuntu22.04
+
+# =============================================================================
+# DNABERT-2 — Apptainer/Singularity container
+#
+# Pins the exact versions from the official DNABERT-2 requirements.txt
+# (https://github.com/MAGICS-LAB/DNABERT_2), plus torch built for CUDA 11.7
+# to match. trust_remote_code=True (used when loading the tokenizer/model)
+# pulls DNABERT-2's custom modeling code at runtime from the HF Hub — no
+# project code is baked into the image.
+#
+# BUILD (needs sudo/root or --fakeroot):
+#   apptainer build dnabert2.sif dnabert2.def
+#
+# RUN (from the Genomic_model directory, so scripts/output are visible):
+#   apptainer exec --nv --bind "$PWD":"$PWD" --pwd "$PWD" dnabert2.sif \
+#       python3 dnabert2_token_count.py --input output/ref_seq_DNA_forward_20260714.npy
+#
+# CPU-only tokenization (e.g. dnabert2_token_count.py) does not need --nv;
+# it's only required when actually running the model (embedding extraction).
+# =============================================================================
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3.10 python3-pip python3.10-dev \
+        ca-certificates git
+    rm -rf /var/lib/apt/lists/*
+
+    python3.10 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+    # torch built against CUDA 11.7, matching the base image
+    python3.10 -m pip install --no-cache-dir \
+        torch==1.13.1+cu117 \
+        --extra-index-url https://download.pytorch.org/whl/cu117
+
+    # Exact pins from DNABERT-2's official requirements.txt
+    python3.10 -m pip install --no-cache-dir \
+        einops==0.6.1 \
+        transformers==4.29.2 \
+        peft==0.3.0 \
+        omegaconf==2.3.0 \
+        evaluate==0.4.0 \
+        accelerate==0.20.3 \
+        scikit-learn==1.2.2 \
+        numpy pandas
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+    # Keep HF cache inside the bound working dir by default
+    export HF_HOME=${HF_HOME:-$PWD/.hf_cache}
+
+%runscript
+    exec python3.10 "$@"
+
+%test
+    python3.10 - <<'PY'
+    import torch, transformers, einops
+    print("torch:", torch.__version__, "| CUDA available:", torch.cuda.is_available())
+    print("transformers:", transformers.__version__)
+    PY
+
+%labels
+    Application DNABERT-2
+    Description Environment for DNABERT-2 tokenization / embedding extraction
+    Python 3.10
+    PyTorch 1.13.1+cu117
+    Source https://github.com/MAGICS-LAB/DNABERT_2
+
+%help
+    Apptainer container for DNABERT-2 (tokenizer + model), pinned to the
+    versions in the official DNABERT_2 requirements.txt.
+
+    Build:
+        apptainer build dnabert2.sif dnabert2.def
+    Run:
+        apptainer exec --bind "$PWD":"$PWD" --pwd "$PWD" dnabert2.sif \
+            python3 dnabert2_token_count.py
+        apptainer exec --nv --bind "$PWD":"$PWD" --pwd "$PWD" dnabert2.sif \
+            python3 your_embedding_script.py
+
+    Notes:
+      * --nv is only needed for GPU (model forward passes), not for
+        tokenizer-only scripts like dnabert2_token_count.py.
+      * trust_remote_code=True downloads DNABERT-2's custom modeling code
+        from the HF Hub on first run — needs network access at runtime.
