@@ -48,10 +48,9 @@ Output
 
 Example
 -------
-apptainer exec --nv --bind "$PWD":"$PWD" --pwd "$PWD" dnabert2.sif \\
-    python3 extract_embeddings_DNABERT2.py \\
-        --ref-file output/20260831_133902/ref_seq_DNA_forward_2500bp.npy \\
-        --mut-file output/20260831_133902/mut_seq_DNA_forward_2500bp.npy
+apptainer exec --nv --bind "$PWD":"$PWD" --pwd "$PWD" sif/dnabert2.sif python3 extract_embeddings_DNABERT2.py --ref-file output/20260831_143505/ref_seq_DNA_forward_2500bp.npy --mut-file mut_seq_DNA_forward_2500bp.npy 
+
+
 """
 
 import argparse
@@ -61,7 +60,7 @@ import re
 import numpy as np
 import pandas as pd
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 MODEL_NAME = "zhihan1996/DNABERT-2-117M"
 MODEL_FAMILY = "DNABERT2"
@@ -205,8 +204,8 @@ def extract_embeddings(
     out_dir: str,
     batch_size: int,
     pool_region: str,
-    downstream_ks: list = None,
-    edit_starts: list = None,
+    downstream_ks: list = None, # type: ignore
+    edit_starts: list = None, # type: ignore
 ) -> None:
     """Extract DNABERT-2's final hidden state, pooled per --pool-region/--emb-type,
     and save one .npy file per region (per k, if swept) into out_dir."""
@@ -258,7 +257,17 @@ if __name__ == "__main__":
     print(f"Using device: {DEVICE}")
     print(f"Loading {args.model} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModel.from_pretrained(args.model, trust_remote_code=True).to(DEVICE).eval()
+
+    # DNABERT-2 ships a Triton flash-attention kernel that uses a removed API
+    # (tl.dot(..., trans_b=True)) and fails to compile on Triton 2.x/3.x. Its
+    # bert_layers.py takes the pure-PyTorch attention path whenever attention
+    # dropout is nonzero, so set it here. eval() makes nn.Dropout an identity,
+    # so embeddings are unchanged -- this only selects the attention implementation.
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    config.attention_probs_dropout_prob = 0.1
+    model = AutoModel.from_pretrained(
+        args.model, config=config, trust_remote_code=True
+    ).to(DEVICE).eval()
     print("Model loaded.\n")
 
     input_files = {
@@ -286,7 +295,7 @@ if __name__ == "__main__":
                 # position = the allele's own last base (0-indexed) — ref allele
                 # for ref_seq, alt allele for mut_seq, since their lengths can differ.
                 allele_len = ref_len if df == "ref_seq" else alt_len
-                positions = (edit_start + allele_len - 1).tolist()
+                positions = (edit_start + allele_len - 1).tolist() # type: ignore
             else:
                 # Reverse-complementing flips reading direction, so the allele's
                 # last base *in the reverse array's own left-to-right order* is
@@ -307,5 +316,5 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             pool_region=args.pool_region,
             downstream_ks=args.downstream_k,
-            edit_starts=positions,
+            edit_starts=positions, # type: ignore
         )

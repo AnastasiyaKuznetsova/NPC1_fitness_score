@@ -18,9 +18,9 @@ is a much smaller model. Runs on CPU or GPU (auto-detected).
 
 Example
 -------
-python dnabert2_zero_shot.py \\
-    --ref-file output/20260831_133902/ref_seq_DNA_forward_2500bp.npy \\
-    --mut-file output/20260831_133902/mut_seq_DNA_forward_2500bp.npy \\
+python dnabert2_zero_shot.py \
+    --ref-file output/20260831_133902/ref_seq_DNA_forward_2500bp.npy \
+    --mut-file output/20260831_133902/mut_seq_DNA_forward_2500bp.npy \
     --out output/dnabert2_zero_shot_scores.csv
 """
 
@@ -30,7 +30,7 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
-from transformers import AutoModelForMaskedLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForMaskedLM, AutoTokenizer
 
 MODEL_NAME = "zhihan1996/DNABERT-2-117M"
 
@@ -93,7 +93,17 @@ def main():
     print(f"Using device: {device}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForMaskedLM.from_pretrained(args.model, trust_remote_code=True).to(device).eval()
+
+    # DNABERT-2 ships a Triton flash-attention kernel that uses a removed API
+    # (tl.dot(..., trans_b=True)) and fails to compile on Triton 2.x/3.x. Its
+    # bert_layers.py takes the pure-PyTorch attention path whenever attention
+    # dropout is nonzero, so set it here. eval() makes nn.Dropout an identity,
+    # so scores are unchanged -- this only selects the attention implementation.
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    config.attention_probs_dropout_prob = 0.1
+    model = AutoModelForMaskedLM.from_pretrained(
+        args.model, config=config, trust_remote_code=True
+    ).to(device).eval()
 
     print(f"Scoring {len(ref_seqs)} reference sequences with DNABERT-2 PLL...")
     ref_scores = []
