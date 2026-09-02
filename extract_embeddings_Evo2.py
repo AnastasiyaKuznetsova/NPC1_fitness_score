@@ -278,7 +278,7 @@ if __name__ == "__main__":
     }
 
     context_window = parse_context_window(input_files["ref_seq"])
-    out_dir = f"{model_family}_{params}_{context_window}_emb"
+    out_dir = os.path.join("embeddings", f"{model_family}_{params}_{context_window}_emb")
 
     edit_start = ref_len = alt_len = None
     if args.pool_region == "downstream":

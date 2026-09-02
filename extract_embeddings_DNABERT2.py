@@ -277,7 +277,7 @@ if __name__ == "__main__":
 
     strand = parse_strand(input_files["ref_seq"])
     context_window = parse_context_window(input_files["ref_seq"])
-    out_dir = f"{MODEL_FAMILY}_{PARAMS_LABEL}_{context_window}_emb"
+    out_dir = os.path.join("embeddings", f"{MODEL_FAMILY}_{PARAMS_LABEL}_{context_window}_emb")
 
     edit_start = ref_len = alt_len = None
     if args.pool_region == "downstream":
