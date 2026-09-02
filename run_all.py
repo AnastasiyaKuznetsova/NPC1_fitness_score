@@ -20,6 +20,10 @@ Command-line options:
                for the whole invocation is also written at the --out_dir root.
   --model_dir  Directory to save each run's best model as a date-stamped .joblib
                file (default: saved_models).
+  --n_jobs     CPU cores per GridSearchCV inner search (default: 4). Set to a
+               slice of your reserved cores when running several run_all.py
+               jobs in parallel on the same node, so they don't oversubscribe
+               each other.
 
 GaussianProcess is always run twice per layer/pooling/emb_type combo — once with
 PCA and once with PLS dimensionality reduction before the GP itself (component
@@ -137,13 +141,13 @@ def setup_run_logging(out_dir: Path, run_name: str) -> None:
     root.addHandler(sh)
 
 
-def run_combo(emb, df, model_name, tag, dr_mode=None, model_dir=None, run_timestamp=None) -> dict:
+def run_combo(emb, df, model_name, tag, dr_mode=None, model_dir=None, run_timestamp=None, n_jobs=4) -> dict:
     groups = df["Protein Annotation"].to_numpy()
     y = df["Function Score"].to_numpy()
     logging.info(f"Grouping by: 'Protein Annotation' ({len(np.unique(groups))} unique groups)")
     fold_metrics, best_model = nested_cv(emb, y, groups, model_name=model_name,
                                          outer_splits=5, inner_splits=3,
-                                         dr_mode=dr_mode)
+                                         dr_mode=dr_mode, n_jobs=n_jobs)
 
     if model_dir is not None and best_model is not None:
         import joblib
@@ -192,6 +196,13 @@ def main():
                         choices=["delta", "concat"],
                         help="Which embedding regimes to sweep (default: both). Use "
                              "'--emb-types delta' to skip concat entirely.")
+    parser.add_argument("--n_jobs", type=int, default=4,
+                        help="CPU cores for each GridSearchCV inner hyperparameter search "
+                             "(default: 4; use -1 for all cores visible to this process). "
+                             "At this dataset's size, most models fit fast enough that wide "
+                             "parallelism mainly helps GaussianProcess; keeping this modest "
+                             "leaves cores free to run several run_all.py jobs in parallel "
+                             "on the same node/allocation without oversubscribing.")
     args = parser.parse_args()
     if "all" in args.models:
         args.models = [m for m in MODELS if m != "Dummy"]
@@ -269,6 +280,7 @@ def main():
                             emb_data, df_fwd, model_name=c["model_name"],
                             tag=run_name, dr_mode=c["dr_mode"],
                             model_dir=args.model_dir, run_timestamp=run_timestamp,
+                            n_jobs=args.n_jobs,
                         )
                     except Exception as e:
                         logging.error(f"FAILED {run_name}: {e}")

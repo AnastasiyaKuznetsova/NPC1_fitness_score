@@ -344,6 +344,7 @@ def simple_cv(
     model_name: str,
     dr_mode: str = None,
     variant_id: np.ndarray = None,
+    n_jobs: int = 4,
 ) -> tuple[list[dict], object]:
     """2-fold group cross-validation (no inner loop) for when only 2 groups exist.
 
@@ -357,7 +358,7 @@ def simple_cv(
     best_test_corr = -np.inf
 
     for fold, (tr, te) in enumerate(cv.split(X, y, groups=groups), 1):
-        pipe = build_pipeline(model_name=model_name, dr_mode=dr_mode)
+        pipe = build_pipeline(model_name=model_name, dr_mode=dr_mode, n_jobs=n_jobs)
         pipe.fit(X[tr], y[tr])
 
         y_train_pred = pipe.predict(X[tr])
@@ -403,6 +404,7 @@ def nested_cv(
     inner_splits: int = 3,
     dr_mode: str = None,
     variant_id: np.ndarray = None,
+    n_jobs: int = 4,
 ) -> list[dict]:
     """
     Nested group K-Fold cross-validation.
@@ -446,6 +448,9 @@ def nested_cv(
         g_outer_tr = groups[outer_tr]
 
         # ── Inner loop: hyperparameter tuning via GridSearchCV ────────────────
+        # RandomForest gets n_jobs=1 here (build_pipeline's default) since
+        # GridSearchCV below already parallelizes across n_jobs cores itself —
+        # letting both parallelize would oversubscribe to n_jobs^2 processes.
         pipe = build_pipeline(model_name=model_name, dr_mode=dr_mode)
         if param_grid:
             gs = GridSearchCV(
@@ -453,7 +458,7 @@ def nested_cv(
                 cv=inner_cv,
                 scoring=gs_scoring,
                 refit="spearman",
-                n_jobs=-1,
+                n_jobs=n_jobs,
             )
             gs.fit(X_outer_tr, y_outer_tr, groups=g_outer_tr)
             best_pipe = gs.best_estimator_
@@ -530,7 +535,7 @@ def nested_cv(
 
 # ── 3. Model ──────────────────────────────────────────────────────────────────
 
-def build_pipeline(model_name: str, dr_mode: str = None) -> Pipeline:
+def build_pipeline(model_name: str, dr_mode: str = None, n_jobs: int = 1) -> Pipeline:
     """Build a StandardScaler [+ DR] + model pipeline.
 
     dr_mode: None | 'pca' | 'pls'
@@ -541,6 +546,12 @@ def build_pipeline(model_name: str, dr_mode: str = None) -> Pipeline:
     'pls' by its callers (see PARAM_GRIDS' "GaussianProcess-pca"/"-pls" entries,
     which grid-search dr__n_components — the initial n_components below is just
     a placeholder overwritten by that search). Other models never pass dr_mode.
+
+    n_jobs: RandomForest's internal core count. Defaults to 1 (not -1) because
+    this pipeline is normally fit inside a GridSearchCV that already parallelizes
+    across --n_jobs cores (see nested_cv/simple_cv) — letting RandomForest also
+    spawn -1 workers per fit would oversubscribe the machine (n_jobs x n_jobs
+    processes). Only bump this when building a pipeline outside that context.
     """
     if model_name not in MODELS:
         raise ValueError(f"Unknown model '{model_name}'. Choose from: {MODELS}")
@@ -577,7 +588,7 @@ def build_pipeline(model_name: str, dr_mode: str = None) -> Pipeline:
         "kNN":          KNeighborsRegressor(n_neighbors=5, weights="distance"),
         "RandomForest": RandomForestRegressor(
             n_estimators=200, max_depth=5, min_samples_leaf=10,
-            max_features="sqrt", random_state=42, n_jobs=-1,
+            max_features="sqrt", random_state=42, n_jobs=n_jobs,
         ),
         "DecisionTree": DecisionTreeRegressor(
             max_depth=5, min_samples_leaf=10, random_state=42,
@@ -607,6 +618,7 @@ def run_single(
     model_dir: Path = None,
     fold_by: str = "Protein Annotation",
     dr_mode: str = None,
+    n_jobs: int = 4,
 ) -> dict:
     """Full pipeline for one embedding matrix using nested CV. Returns mean ± std metrics."""
     logging.info("=" * 60)
@@ -639,11 +651,11 @@ def run_single(
 
     if n_groups == 2:
         fold_metrics, best_model = simple_cv(emb, y, groups, model_name=model_name,
-                                             dr_mode=dr_mode, variant_id=variant_id)
+                                             dr_mode=dr_mode, variant_id=variant_id, n_jobs=n_jobs)
     else:
         fold_metrics, best_model = nested_cv(emb, y, groups, model_name=model_name,
                                              outer_splits=outer_splits, inner_splits=inner_splits,
-                                             dr_mode=dr_mode, variant_id=variant_id)
+                                             dr_mode=dr_mode, variant_id=variant_id, n_jobs=n_jobs)
 
     if model_dir is not None and best_model is not None:
         model_dir = Path(model_dir)
@@ -697,11 +709,13 @@ def main(args):
                     tag = f"GaussianProcess-{dr_label} | {regime_label} | {args.strand} | {k_label}"
                     results.append(run_single(emb, df, model_name="GaussianProcess",
                                               tag=tag, model_dir=args.model_dir,
-                                              fold_by=args.fold_by, dr_mode=dr_mode))
+                                              fold_by=args.fold_by, dr_mode=dr_mode,
+                                              n_jobs=args.n_jobs))
             else:
                 tag = f"{model_name} | {regime_label} | {args.strand} | {k_label}"
                 results.append(run_single(emb, df, model_name=model_name,
-                                          tag=tag, model_dir=args.model_dir, fold_by=args.fold_by))
+                                          tag=tag, model_dir=args.model_dir, fold_by=args.fold_by,
+                                          n_jobs=args.n_jobs))
         results.append(run_single(emb, df, model_name="Dummy",
                                   tag=f"Dummy (mean baseline) | {k_label}",
                                   model_dir=None, fold_by=args.fold_by))
@@ -781,6 +795,13 @@ if __name__ == "__main__":
                         choices=MODELS + ["all"],
                         help=f"Models to run (default: Ridge), or 'all' to run every model. "
                              f"Choices: {MODELS}")
+    parser.add_argument("--n_jobs", type=int, default=4,
+                        help="CPU cores for GridSearchCV's inner hyperparameter search "
+                             "(default: 4; use -1 for all cores visible to this process). "
+                             "At this dataset's size, most models fit fast enough that wide "
+                             "parallelism mainly helps GaussianProcess; keeping this modest "
+                             "leaves cores free to run several jobs in parallel on the same "
+                             "node/allocation without oversubscribing.")
 
     # Logging
     parser.add_argument("--model_dir", default=None,
