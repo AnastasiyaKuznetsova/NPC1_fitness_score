@@ -9,19 +9,18 @@ All sequences sharing a cluster_id are kept together in either train or test —
 no data leakage from identical sequences across splits.
 
 Embedding modes:
-  --emb_mode rna          : single .npy file of RNA embeddings (original behaviour)
-  --emb_mode dna --delta  : delta embeddings (mut - ref)
-  --emb_mode dna          : concat embeddings (mut || ref)
+  --delta  : delta embeddings (mut - ref)
+  (default): concat embeddings (mut || ref)
 
- The val_r works because predictions vary slightly across inner folds (each fold predicts a different mean). 
- For train/test with dummy, predictions are constant → NaN. The user just wants the raw computed value — remove the NaN→0 
+ The val_r works because predictions vary slightly across inner folds (each fold predicts a different mean).
+ For train/test with dummy, predictions are constant → NaN. The user just wants the raw computed value — remove the NaN→0
  fallback entirely:
 
-Now it returns whatever Spearman computes — NaN for constant predictions (dummy train/test), a real number otherwise. 
-The NaN will show up in the summary and CSV as nan, which is the honest result. 
+Now it returns whatever Spearman computes — NaN for constant predictions (dummy train/test), a real number otherwise.
+The NaN will show up in the summary and CSV as nan, which is the honest result.
 
-python3 regressor.py --emb_mode dna --emb emb_1B --strand forward --delta \
-    --pca 50 --models Ridge --model_dir saved_models/
+python3 regressor.py --emb emb_1B --strand forward --delta \
+    --models Ridge --model_dir saved_models/
 
 """
 
@@ -155,14 +154,6 @@ def setup_logging(log_dir: str = "logs") -> Path:
 
 
 # ── 1. Load data ──────────────────────────────────────────────────────────────
-
-def load_data_rna(path_to_df: str, path_to_emb: str) -> tuple[pd.DataFrame, np.ndarray]:
-    """Original RNA path: single embedding matrix."""
-    sep = "\t" if path_to_df.endswith(".tsv") else ","
-    df  = pd.read_csv(path_to_df, sep=sep)
-    emb = np.load(path_to_emb)
-    return df, emb
-
 
 def _load_ref_mut(emb_dir, strand: str, layer: str = None, pooling: str = None,
                    downstream_k: str = None) -> tuple[np.ndarray, np.ndarray]:
@@ -351,7 +342,6 @@ def simple_cv(
     y: np.ndarray,
     groups: np.ndarray,
     model_name: str,
-    pca_components: int = None,
     dr_mode: str = None,
     variant_id: np.ndarray = None,
 ) -> tuple[list[dict], object]:
@@ -367,7 +357,7 @@ def simple_cv(
     best_test_corr = -np.inf
 
     for fold, (tr, te) in enumerate(cv.split(X, y, groups=groups), 1):
-        pipe = build_pipeline(model_name=model_name, pca_components=pca_components, dr_mode=dr_mode)
+        pipe = build_pipeline(model_name=model_name, dr_mode=dr_mode)
         pipe.fit(X[tr], y[tr])
 
         y_train_pred = pipe.predict(X[tr])
@@ -411,7 +401,6 @@ def nested_cv(
     model_name: str,
     outer_splits: int = 5,
     inner_splits: int = 3,
-    pca_components: int = None,
     dr_mode: str = None,
     variant_id: np.ndarray = None,
 ) -> list[dict]:
@@ -457,7 +446,7 @@ def nested_cv(
         g_outer_tr = groups[outer_tr]
 
         # ── Inner loop: hyperparameter tuning via GridSearchCV ────────────────
-        pipe = build_pipeline(model_name=model_name, pca_components=pca_components, dr_mode=dr_mode)
+        pipe = build_pipeline(model_name=model_name, dr_mode=dr_mode)
         if param_grid:
             gs = GridSearchCV(
                 pipe, param_grid,
@@ -478,7 +467,7 @@ def nested_cv(
             # No grid to search — fit once and get val metrics via manual inner CV
             val_y_true, val_y_pred = [], []
             for inner_tr, inner_val in inner_cv.split(X_outer_tr, y_outer_tr, groups=g_outer_tr):
-                p = build_pipeline(model_name=model_name, pca_components=pca_components, dr_mode=dr_mode)
+                p = build_pipeline(model_name=model_name, dr_mode=dr_mode)
                 p.fit(X_outer_tr[inner_tr], y_outer_tr[inner_tr])
                 val_y_true.append(y_outer_tr[inner_val])
                 val_y_pred.append(p.predict(X_outer_tr[inner_val]))
@@ -541,14 +530,17 @@ def nested_cv(
 
 # ── 3. Model ──────────────────────────────────────────────────────────────────
 
-def build_pipeline(model_name: str, pca_components: int = None, dr_mode: str = None) -> Pipeline:
+def build_pipeline(model_name: str, dr_mode: str = None) -> Pipeline:
     """Build a StandardScaler [+ DR] + model pipeline.
 
     dr_mode: None | 'pca' | 'pls'
       - 'pca' : unsupervised PCA before the model
       - 'pls' : supervised PLSRegression used as a transformer (fitted on X and y)
       - None  : no dimensionality reduction
-    Only used when pca_components is set. For GaussianProcess, all three are run separately.
+    Only meaningful for GaussianProcess, which is always run with both 'pca' and
+    'pls' by its callers (see PARAM_GRIDS' "GaussianProcess-pca"/"-pls" entries,
+    which grid-search dr__n_components — the initial n_components below is just
+    a placeholder overwritten by that search). Other models never pass dr_mode.
     """
     if model_name not in MODELS:
         raise ValueError(f"Unknown model '{model_name}'. Choose from: {MODELS}")
@@ -561,22 +553,15 @@ def build_pipeline(model_name: str, pca_components: int = None, dr_mode: str = N
     scaler_step = [] if tree_based else [("scaler", StandardScaler())]
 
     # Dimensionality reduction step
-    if pca_components and dr_mode == "pca" and model_name != "PLS":
-        dr_step = [("dr", PCA(n_components=pca_components, random_state=42))]
-        dr_label = f"PCA({pca_components}) + "
-    elif pca_components and dr_mode == "pls" and model_name != "PLS":
-        dr_step = [("dr", PLSTransformer(n_components=min(pca_components, 20)))]
-        dr_label = f"PLS-DR({pca_components}) + "
-    elif pca_components and model_name != "PLS" and dr_mode is None:
-        # Legacy behaviour for non-GP models: --pca uses PCA by default
-        dr_step = [("dr", PCA(n_components=pca_components, random_state=42))]
-        dr_label = f"PCA({pca_components}) + "
+    if dr_mode == "pca" and model_name != "PLS":
+        dr_step = [("dr", PCA(n_components=20, random_state=42))]
+        dr_label = "PCA + "
+    elif dr_mode == "pls" and model_name != "PLS":
+        dr_step = [("dr", PLSTransformer(n_components=10))]
+        dr_label = "PLS-DR + "
     else:
         dr_step = []
         dr_label = ""
-
-    use_pca = bool(pca_components) and model_name != "PLS"
-    pca_label = dr_label
 
     regressors = {
         "Ridge":       Ridge(alpha=100.0),
@@ -584,7 +569,7 @@ def build_pipeline(model_name: str, pca_components: int = None, dr_mode: str = N
         "ElasticNet":  ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
         "KernelRidge": KernelRidge(kernel="rbf", alpha=1.0),
         "SVR":         SVR(kernel="rbf", C=1.0),
-        "PLS":         PLSRegression(n_components=min(pca_components or 20, 20)),
+        "PLS":         PLSRegression(n_components=20),
         "GaussianProcess": GaussianProcessRegressor(
             kernel=RBF(length_scale_bounds=_GP_BOUNDS) + WhiteKernel(noise_level_bounds=_GP_BOUNDS),
             random_state=42, normalize_y=True, n_restarts_optimizer=5,
@@ -599,7 +584,7 @@ def build_pipeline(model_name: str, pca_components: int = None, dr_mode: str = N
         ),
     }
 
-    logging.info(f"Using {pca_label}{model_name}")
+    logging.info(f"Using {dr_label}{model_name}")
     return Pipeline([
         *scaler_step,
         *dr_step,
@@ -619,7 +604,6 @@ def run_single(
     tag: str = "",
     outer_splits: int = 5,
     inner_splits: int = 3,
-    pca_components: int = None,
     model_dir: Path = None,
     fold_by: str = "Protein Annotation",
     dr_mode: str = None,
@@ -655,13 +639,11 @@ def run_single(
 
     if n_groups == 2:
         fold_metrics, best_model = simple_cv(emb, y, groups, model_name=model_name,
-                                             pca_components=pca_components, dr_mode=dr_mode,
-                                             variant_id=variant_id)
+                                             dr_mode=dr_mode, variant_id=variant_id)
     else:
         fold_metrics, best_model = nested_cv(emb, y, groups, model_name=model_name,
                                              outer_splits=outer_splits, inner_splits=inner_splits,
-                                             pca_components=pca_components, dr_mode=dr_mode,
-                                             variant_id=variant_id)
+                                             dr_mode=dr_mode, variant_id=variant_id)
 
     if model_dir is not None and best_model is not None:
         model_dir = Path(model_dir)
@@ -694,57 +676,35 @@ def main(args):
 
     regime_label = "delta" if args.delta else "concat"
 
-    if args.emb_mode == "rna":
-        if not args.emb:
-            raise ValueError("--emb is required for --emb_mode rna")
-        df, emb = load_data_rna(args.df, args.emb)
+    if not args.emb:
+        raise ValueError("--emb is required")
+    use_reverse = args.strand == "both"
+    strand = "forward" if args.strand != "reverse" else "reverse"
+
+    for k in args.downstream_k:
+        k_label = k  # "full", "all", or an integer string — used verbatim in the tag
+        downstream_k = None if k == "full" else k
+        logging.info(f"\n### downstream_k={k_label} ###")
+        df, emb = load_data_dna(args.df, args.emb, args.delta, use_reverse=use_reverse,
+                                 strand=strand, layer=args.layer, pooling=args.pooling,
+                                 downstream_k=downstream_k,
+                                 variant_meta_file=args.variant_meta_file)
 
         for model_name in args.models:
-            tag = f"{model_name} | {regime_label} | {args.strand}"
-            results.append(run_single(emb, df, model_name=model_name,
-                                      tag=tag, pca_components=args.pca,
-                                      model_dir=args.model_dir, fold_by=args.fold_by))
+            if model_name == "GaussianProcess":
+                # GP always runs with both DR options: PCA and PLS (supervised)
+                for dr_label, dr_mode in (("pca", "pca"), ("pls", "pls")):
+                    tag = f"GaussianProcess-{dr_label} | {regime_label} | {args.strand} | {k_label}"
+                    results.append(run_single(emb, df, model_name="GaussianProcess",
+                                              tag=tag, model_dir=args.model_dir,
+                                              fold_by=args.fold_by, dr_mode=dr_mode))
+            else:
+                tag = f"{model_name} | {regime_label} | {args.strand} | {k_label}"
+                results.append(run_single(emb, df, model_name=model_name,
+                                          tag=tag, model_dir=args.model_dir, fold_by=args.fold_by))
         results.append(run_single(emb, df, model_name="Dummy",
-                                  tag="Dummy (mean baseline)", pca_components=None,
+                                  tag=f"Dummy (mean baseline) | {k_label}",
                                   model_dir=None, fold_by=args.fold_by))
-
-    elif args.emb_mode == "dna":
-        if not args.emb:
-            raise ValueError("--emb is required for --emb_mode dna")
-        use_reverse = args.strand == "both"
-        strand = "forward" if args.strand != "reverse" else "reverse"
-
-        for k in args.downstream_k:
-            k_label = k  # "full", "all", or an integer string — used verbatim in the tag
-            downstream_k = None if k == "full" else k
-            logging.info(f"\n### downstream_k={k_label} ###")
-            df, emb = load_data_dna(args.df, args.emb, args.delta, use_reverse=use_reverse,
-                                     strand=strand, layer=args.layer, pooling=args.pooling,
-                                     downstream_k=downstream_k,
-                                     variant_meta_file=args.variant_meta_file)
-
-            for model_name in args.models:
-                if model_name == "GaussianProcess":
-                    # Run GP with three DR options: PCA, PLS (supervised), and none
-                    gp_dr_options = [("pca", "pca"), ("pls", "pls"), ("none", None)]
-                    if not args.pca:
-                        gp_dr_options = [("none", None)]  # no components specified — only plain GP
-                    for dr_label, dr_mode in gp_dr_options:
-                        tag = f"GaussianProcess-{dr_label} | {regime_label} | {args.strand} | {k_label}"
-                        results.append(run_single(emb, df, model_name="GaussianProcess",
-                                                  tag=tag, pca_components=args.pca,
-                                                  model_dir=args.model_dir, fold_by=args.fold_by,
-                                                  dr_mode=dr_mode))
-                else:
-                    tag = f"{model_name} | {regime_label} | {args.strand} | {k_label}"
-                    results.append(run_single(emb, df, model_name=model_name,
-                                              tag=tag, pca_components=args.pca,
-                                              model_dir=args.model_dir, fold_by=args.fold_by))
-            results.append(run_single(emb, df, model_name="Dummy",
-                                      tag=f"Dummy (mean baseline) | {k_label}", pca_components=None,
-                                      model_dir=None, fold_by=args.fold_by))
-    else:
-        raise ValueError(f"Unknown emb_mode: {args.emb_mode}")
 
     # ── Summary table ──────────────────────────────────────────────────────
     logging.info("\n" + "=" * 60)
@@ -774,42 +734,37 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train regressor on RNA or DNA (delta/concat) embeddings."
+        description="Train regressor on DNA (delta/concat) embeddings."
     )
 
     parser.add_argument("--df", default="output/df_preprocessed.csv",
                         help="Path to preprocessed CSV/TSV with Function Score "
                              "and Protein Annotation columns.")
 
-    parser.add_argument("--emb_mode", choices=["rna", "dna"], default="dna",
-                        help="Embedding mode: 'rna' (single .npy) or "
-                             "'dna' (ref + mut .npy files). Default: rna")
-
-    # RNA args
-    parser.add_argument("--emb",
-                        help="[RNA mode] Path to RNA embedding .npy file.")
+    parser.add_argument("--emb", required=True,
+                        help="Directory with ref_seq_*/mut_seq_* .npy embedding files.")
 
     parser.add_argument("--strand", choices=["forward", "reverse", "both"], default="forward",
-                        help="[DNA mode] Which strand(s) to use: 'forward', 'reverse', or "
+                        help="Which strand(s) to use: 'forward', 'reverse', or "
                              "'both' (forward + reverse concatenated). Default: forward.")
     parser.add_argument("--delta", action="store_true",
-                        help="[DNA mode] Use delta (mut - ref) embeddings. "
+                        help="Use delta (mut - ref) embeddings. "
                              "Default without this flag is concat (mut || ref).")
     parser.add_argument("--layer", default=None,
-                        help="[DNA mode] Layer index to select (e.g. 27). Required when the "
+                        help="Layer index to select (e.g. 27). Required when the "
                              "embedding directory contains multiple layers.")
     parser.add_argument("--pooling", choices=["average", "last"], default=None,
-                        help="[DNA mode] Pooling mode: 'average' or 'last'. Required when the "
+                        help="Pooling mode: 'average' or 'last'. Required when the "
                              "embedding directory contains multiple pooling modes.")
     parser.add_argument("--downstream-k", nargs="+", default=["full"], metavar="K",
-                        help="[DNA mode] One or more --pool-region downstream variants written by "
+                        help="One or more --pool-region downstream variants written by "
                              "extract_embeddings.py to compare in this run: 'full' (default) for "
                              "the plain full-sequence embeddings, an integer (e.g. 0, 32, 128, "
                              "512), or 'all'. Each value is loaded and run through every model in "
                              "--models, labeled in the tag/results (e.g. --downstream-k full 0 32 "
                              "128 512 all compares all six in one run).")
     parser.add_argument("--variant-meta-file", default=None, metavar="FILE",
-                        help="[DNA mode] variant_meta.csv written by prepare_dataset.py --jitter "
+                        help="variant_meta.csv written by prepare_dataset.py --jitter "
                              "(needs a 'variant_id' column). Expands --df to one row per "
                              "(variant, offset) matching the jittered embeddings, trains on every "
                              "offset as an independent sample, and averages test-fold predictions "
@@ -828,9 +783,6 @@ if __name__ == "__main__":
                              f"Choices: {MODELS}")
 
     # Logging
-    parser.add_argument("--pca", type=int, default=None,
-                        help="Number of PCA components before regression. "
-                             "Omit to skip PCA (default: no PCA).")
     parser.add_argument("--model_dir", default=None,
                         help="Directory to save the best model per run as a .joblib file. "
                              "Omit to skip saving.")
@@ -851,31 +803,21 @@ if __name__ == "__main__":
 
 # ── Usage examples ────────────────────────────────────────────────────────────
 #
-# RNA, Ridge:
+# Delta, forward strand, Ridge + SVR:
 #   python regressor.py \
 #       --df output/df_preprocessed.csv \
-#       --emb_mode rna \
-#       --emb output/rna_embeddings.npy \
-#       --linear
-#
-# DNA delta, forward strand, Ridge + SVR, PCA(50):
-#   python regressor.py \
-#       --df output/df_preprocessed.csv \
-#       --emb_mode dna --delta \
 #       --emb embeddings/ \
-#       --strand forward --pca 50 --models Ridge SVR
+#       --delta --strand forward --models Ridge SVR
 #
-# DNA concat, reverse strand, ElasticNet + SVR, PCA(50):
+# Concat, reverse strand, ElasticNet + SVR:
 #   python regressor.py \
 #       --df output/df_preprocessed.csv \
-#       --emb_mode dna \
 #       --emb embeddings/ \
-#       --strand reverse --pca 50 --models ElasticNet SVR
+#       --strand reverse --models ElasticNet SVR
 #
-# DNA delta, forward + reverse, all models, PCA(50):
+# Delta, forward + reverse, all models (GaussianProcess always runs PCA + PLS variants):
 #   python regressor.py \
 #       --df output/df_preprocessed.csv \
-#       --emb_mode dna --delta \
 #       --emb embeddings/ \
-#       --strand both --pca 50 \
+#       --delta --strand both \
 #       --models Ridge Lasso ElasticNet KernelRidge SVR PLS GaussianProcess kNN
