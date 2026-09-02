@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from regressor import load_data_dna, nested_cv, build_pipeline, MODELS
+from regressor import load_data_dna, nested_cv, build_pipeline, parse_model_label, MODELS
 
 
 def get_hyperparams(model_name: str, dr_mode: str = None) -> str:
@@ -64,18 +64,6 @@ def get_hyperparams(model_name: str, dr_mode: str = None) -> str:
     }.get(model_name, [])
     param_str = ", ".join(f"{k}={params[k]}" for k in key_params if k in params)
     return f"{dr_str}{param_str}" if param_str else dr_str or "default"
-
-
-def parse_model_label(emb_dir: Path) -> str:
-    """Derive a '{FAMILY}_{PARAMS}' label from the --emb directory name, e.g.
-    'embeddings/DNABERT2_117M_2500bp_emb' -> 'DNABERT2_117M', or
-    'embeddings/Evo2_7B_8192bp_emb' -> 'Evo2_7B' — matching the
-    '{MODEL_FAMILY}_{PARAMS_LABEL}_{context_window}_emb' naming written by
-    extract_embeddings_DNABERT2.py / extract_embeddings_Evo2.py. Falls back to
-    the raw directory name if it doesn't match that pattern.
-    """
-    m = re.match(r"^([A-Za-z0-9]+)_([A-Za-z0-9]+)_", emb_dir.name)
-    return f"{m.group(1)}_{m.group(2)}" if m else emb_dir.name
 
 
 def extract_layer_pooling_combos(emb_dir: Path, strand: str) -> list[tuple[str, str]]:
@@ -211,6 +199,9 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     emb_dir = Path(args.emb)
     model_label = parse_model_label(emb_dir)
+    # Nest saved models under a subfolder named for the foundation model the
+    # embeddings came from, so saved_models/ doesn't mix DNABERT-2/Evo2/etc. runs.
+    model_dir = str(Path(args.model_dir) / model_label)
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     delta_options = ([True] if args.emb_types == ["delta"] else
@@ -279,7 +270,7 @@ def main():
                         metrics = run_combo(
                             emb_data, df_fwd, model_name=c["model_name"],
                             tag=run_name, dr_mode=c["dr_mode"],
-                            model_dir=args.model_dir, run_timestamp=run_timestamp,
+                            model_dir=model_dir, run_timestamp=run_timestamp,
                             n_jobs=args.n_jobs,
                         )
                     except Exception as e:
