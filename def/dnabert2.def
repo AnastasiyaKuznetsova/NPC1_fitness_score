@@ -61,6 +61,12 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
     export LC_ALL=C.UTF-8
     export LANG=C.UTF-8
     export PYTHONUNBUFFERED=1
+    # Apptainer auto-binds the host $HOME; without these, python3.10 can pick
+    # up a numpy from the host's ~/.local user-site (built for a different
+    # python/glibc), which torch silently treats as "not available" and
+    # raises RuntimeError: Numpy is not available on any .numpy() call.
+    export PYTHONNOUSERSITE=1
+    unset PYTHONPATH
     # Keep HF cache inside the bound working dir by default
     export HF_HOME=${HF_HOME:-$PWD/.hf_cache}
 
