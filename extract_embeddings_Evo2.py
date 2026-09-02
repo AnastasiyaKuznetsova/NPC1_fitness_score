@@ -52,6 +52,8 @@ import torch
 import numpy as np
 import pandas as pd
 
+from embedding_utils import parse_context_window, parse_downstream_k, pool, pool_downstream
+
 DEFAULT_MODEL_ID = "evo2_7b"
 DEFAULT_LAYER_NAME = "blocks.28.mlp.l3"
 BATCH_SIZE = 1
@@ -78,51 +80,6 @@ def layer_index(layer: str) -> str:
 def build_filename(layer: str, mode: str, strand: str, region_suffix: str = "") -> str:
     suffix = f"_{region_suffix}" if region_suffix else ""
     return f"L{layer_index(layer)}_{mode}_{strand}{suffix}.npy"
-
-
-def parse_context_window(path: str) -> str:
-    """Extract the '<N>bp' context-window token from a filename written by
-    prepare_dataset.py (e.g. ref_seq_DNA_forward_8192bp.npy or
-    variant_meta_8192bp.csv), for use in the output folder name."""
-    m = re.search(r"(\d+bp)", os.path.basename(path))
-    if not m:
-        raise ValueError(
-            f"Could not find a '<N>bp' context-window token in filename {path!r}. "
-            "Expected a name like '..._8192bp.npy' as written by prepare_dataset.py."
-        )
-    return m.group(1)
-
-
-def pool(hidden: torch.Tensor, lengths: list[int], emb_type: str) -> torch.Tensor:
-    """Apply pooling to a (B, L, D) hidden state tensor over the full sequence."""
-    if emb_type == "average":
-        mask = torch.zeros((hidden.shape[0], hidden.shape[1]), dtype=torch.bool, device=hidden.device)
-        for b, l in enumerate(lengths):
-            mask[b, :l] = True
-        mask_expanded = mask.unsqueeze(-1).float()
-        return (hidden * mask_expanded).sum(1) / mask_expanded.sum(1)
-    else:  # last
-        last_indices = torch.tensor([l - 1 for l in lengths], device=hidden.device)
-        return hidden[torch.arange(hidden.shape[0], device=hidden.device), last_indices]
-
-
-def pool_downstream(hidden: torch.Tensor, lengths: list[int], starts: list[int], k) -> torch.Tensor:
-    """Mean over positions [start, start+k] per sequence (inclusive — k=0 is
-    just the allele's own last base; k == "all" means [start, length)), where
-    `start` is the earliest position whose causal context has fully seen the
-    allele (see main() for how forward/reverse starts are derived from
-    prepare_dataset.py's variant_meta.csv)."""
-    B, L = hidden.shape[0], hidden.shape[1]
-    region_start = [min(s, l) for s, l in zip(starts, lengths)]
-    region_end = lengths if k == "all" else [min(s + k + 1, l) for s, l in zip(starts, lengths)]
-    if any(e <= s for s, e in zip(region_start, region_end)):
-        print("  WARNING: empty downstream region for at least one sequence "
-              "(edit sits at/past the sequence end) — that row's pooled vector will be all zeros")
-    mask = torch.zeros((B, L), dtype=torch.bool, device=hidden.device)
-    for b, (s, e) in enumerate(zip(region_start, region_end)):
-        mask[b, s:e] = True
-    mask_expanded = mask.unsqueeze(-1).float()
-    return (hidden * mask_expanded).sum(1) / mask_expanded.sum(1).clamp(min=1)
 
 
 # ── Evo2 ────────────────────────────────────────────────────────────────────────
@@ -153,15 +110,6 @@ def load_model(model_name: str):
     raise ValueError(f"Unknown model {model_name!r}. Choose from: {ALL_MODEL_CHOICES}")
 
 
-def _parse_k(value: str):
-    if value == "all":
-        return "all"
-    try:
-        return int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"--downstream-k values must be 'all' or an integer, got {value!r}")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract zero-shot embeddings from DNA/RNA sequences.")
     parser.add_argument("--model", default=DEFAULT_MODEL_ID, choices=ALL_MODEL_CHOICES,
@@ -190,7 +138,7 @@ def parse_args() -> argparse.Namespace:
                         help="'full' (default) pools over the whole sequence. 'downstream' "
                              "pools from the allele's own last base onward, using the variant "
                              "metadata CSV written by prepare_dataset.py.")
-    parser.add_argument("--downstream-k", nargs="+", default=["all"], type=_parse_k, metavar="K",
+    parser.add_argument("--downstream-k", nargs="+", default=["all"], type=parse_downstream_k, metavar="K",
                         help="Window sizes to test when --pool-region downstream: each is either "
                              "an integer k (positions [start, start+k], inclusive, where start is "
                              "the allele's own last base — the earliest position whose causal "

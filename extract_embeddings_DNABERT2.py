@@ -62,24 +62,13 @@ import pandas as pd
 import torch
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
+from embedding_utils import parse_context_window, parse_downstream_k
+
 MODEL_NAME = "zhihan1996/DNABERT-2-117M"
 MODEL_FAMILY = "DNABERT2"
 PARAMS_LABEL = "117M"
 BATCH_SIZE = 8
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def parse_context_window(path: str) -> str:
-    """Extract the '<N>bp' context-window token from a filename written by
-    prepare_dataset.py (e.g. ref_seq_DNA_forward_8192bp.npy or
-    variant_meta_8192bp.csv), for use in the output folder name."""
-    m = re.search(r"(\d+bp)", os.path.basename(path))
-    if not m:
-        raise ValueError(
-            f"Could not find a '<N>bp' context-window token in filename {path!r}. "
-            "Expected a name like '..._8192bp.npy' as written by prepare_dataset.py."
-        )
-    return m.group(1)
 
 
 def parse_strand(path: str) -> str:
@@ -145,15 +134,6 @@ def token_start_for_position(offsets: list[tuple[int, int]], position: int) -> i
     return last_real
 
 
-def _parse_k(value: str):
-    if value == "all":
-        return "all"
-    try:
-        return int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"--downstream-k values must be 'all' or an integer, got {value!r}")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract DNABERT-2 embeddings from DNA sequences.")
     parser.add_argument("--model", default=MODEL_NAME, help=f"HF model name. Default: {MODEL_NAME}")
@@ -175,7 +155,7 @@ def parse_args() -> argparse.Namespace:
                         help="'full' (default) pools over the whole sequence. 'downstream' "
                              "pools from the token covering the allele's own last base onward, "
                              "using the variant metadata CSV written by prepare_dataset.py.")
-    parser.add_argument("--downstream-k", nargs="+", default=["all"], type=_parse_k, metavar="K",
+    parser.add_argument("--downstream-k", nargs="+", default=["all"], type=parse_downstream_k, metavar="K",
                         help="Window sizes to test when --pool-region downstream: each is either "
                              "an integer k (token positions [start, start+k], inclusive) or the "
                              "literal 'all' (everything from start to the sequence end). One "
