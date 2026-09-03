@@ -110,25 +110,25 @@ From: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 %test
     . /opt/venv/bin/activate
     python - <<'PY'
-    import torch, mamba_ssm, causal_conv1d
-    print("torch:", torch.__version__, "| CUDA build:", torch.version.cuda)
-    try:
-        import flash_attn
-        print("flash_attn:", flash_attn.__version__)
-    except Exception as e:
-        print("flash_attn import note:", e)
-    print("mamba_ssm + causal_conv1d import OK")
-    print("CUDA available at test time:", torch.cuda.is_available())
+import torch, mamba_ssm, causal_conv1d
+print("torch:", torch.__version__, "| CUDA build:", torch.version.cuda)
+try:
+    import flash_attn
+    print("flash_attn:", flash_attn.__version__)
+except Exception as e:
+    print("flash_attn import note:", e)
+print("mamba_ssm + causal_conv1d import OK")
+print("CUDA available at test time:", torch.cuda.is_available())
 
-    # Actually import the janusdna package extract_embeddings_JanusDNA.py needs,
-    # so a missing/mismatched dep (e.g. wandb, transformers) fails the build
-    # instead of surfacing later at the first real run.
-    import sys
-    sys.path.insert(0, "/opt/JanusDNA")
-    from janusdna.configuration_janusdna import JanusDNAConfig
-    from janusdna.modeling_janusdna import JanusDNAModel
-    print("janusdna.configuration_janusdna / modeling_janusdna import OK")
-    PY
+# Actually import the janusdna package extract_embeddings_JanusDNA.py needs,
+# so a missing/mismatched dep (e.g. wandb, transformers) fails the build
+# instead of surfacing later at the first real run.
+import sys
+sys.path.insert(0, "/opt/JanusDNA")
+from janusdna.configuration_janusdna import JanusDNAConfig
+from janusdna.modeling_janusdna import JanusDNAModel
+print("janusdna.configuration_janusdna / modeling_janusdna import OK")
+PY
 
 %labels
     Application JanusDNA
