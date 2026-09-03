@@ -73,8 +73,12 @@ From: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 
     # ---- Runtime deps of the wheels above (installed --no-deps, so their own
     # ---- pure-Python deps need pinning here) + what janusdna's modeling/config
-    # ---- code and extract_embeddings_JanusDNA.py actually import. Versions
-    # ---- match JanusDNA's own janusdna.yml.
+    # ---- code and extract_embeddings_JanusDNA.py actually import. omegaconf/
+    # ---- hydra-core/pytorch-lightning are needed to unpickle the released
+    # ---- .ckpt files themselves (torch.load has to import whatever classes
+    # ---- were pickled into the checkpoint by JanusDNA's Hydra+Lightning
+    # ---- training pipeline, even though we only read out the state_dict).
+    # ---- Versions match JanusDNA's own janusdna.yml.
     pip install --no-cache-dir \
         einops==0.8.0 \
         packaging==24.2 \
@@ -83,7 +87,10 @@ From: nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
         transformers==4.49.0 \
         wandb==0.19.6 \
         numpy==1.26.0 \
-        pandas==2.1.4
+        pandas==2.1.4 \
+        omegaconf==2.3.0 \
+        hydra-core==1.3.2 \
+        pytorch-lightning==2.5.0.post0
 
     # selene-sdk is installed without deps, per the JanusDNA README
     pip install --no-cache-dir selene-sdk --no-deps
