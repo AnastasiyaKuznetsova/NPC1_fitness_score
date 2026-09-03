@@ -3,6 +3,7 @@ janusdna_zero_shot.py. See extract_embeddings_JanusDNA.py's module docstring
 for the full architecture/context-length background these values come from.
 """
 
+import json
 import os
 
 import torch
@@ -64,13 +65,33 @@ def build_config(vocab_size: int, JanusDNAConfig, config_json: str):
     that file (no manual-architecture fallback, since a hand-maintained
     hidden_size/intermediate_size/... guess would just drift from whatever
     Dataverse actually shipped). vocab_size is overridden with the value
-    inferred from the checkpoint itself (infer_vocab_size)."""
-    config = JanusDNAConfig.from_json_file(config_json)
+    inferred from the checkpoint itself (infer_vocab_size).
+
+    Dataverse's JSON is NOT the flat dump JanusDNAConfig.from_json_file()
+    expects — it nests everything under a "config" key alongside a Hydra
+    "_target_" marker, e.g. {"config": {"_target_": "...", "hidden_size": 32,
+    ...}}. from_json_file() would parse that whole nested dict as a single
+    unrecognized `config=` kwarg (JanusDNAConfig has no such parameter),
+    which PretrainedConfig silently absorbs via **kwargs — so every real
+    field would silently stay at its class default instead of erroring. This
+    unwraps that nesting and constructs JanusDNAConfig from the real fields.
+    """
+    with open(config_json) as f:
+        raw = json.load(f)
+    fields = dict(raw.get("config", raw))
+    fields.pop("_target_", None)
+    # A training-script quirk in Dataverse's dump: bidirectional is sometimes
+    # the literal string "true," (trailing comma) instead of a bool.
+    if isinstance(fields.get("bidirectional"), str):
+        fields["bidirectional"] = fields["bidirectional"].strip(", ").lower() == "true"
+
+    config = JanusDNAConfig(**fields)
     config.vocab_size = vocab_size
     # sdpa avoids needing flash-attn / a working torch.compile'd flex_attention
     # just to run mid-stack attention sublayers on midattn checkpoints.
     config._attn_implementation = "sdpa"
-    print(f"Loaded architecture from {config_json}")
+    print(f"Loaded architecture from {config_json}: hidden_size={config.hidden_size}, "
+          f"intermediate_size={config.intermediate_size}, num_hidden_layers={config.num_hidden_layers}")
     return config
 
 
