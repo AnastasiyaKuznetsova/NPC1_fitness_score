@@ -11,44 +11,34 @@ script needs two things Evo2/DNABERT-2 don't:
                     layers require the compiled CUDA kernels).
   --checkpoint      A local pretrained-weights file downloaded from the
                     JanusDNA Harvard Dataverse release (doi:10.7910/DVN/HDT0RN
-                    — not auto-downloaded by this script). vocab_size is
-                    inferred from the checkpoint's embed_tokens.weight shape;
-                    everything else about the architecture comes from
-                    --model-size (see MODEL_PRESETS below).
+                    — not auto-downloaded by this script; requires an access
+                    request through Dataverse's own UI). All 5 known configs
+                    below (including 144dim_nomidattn) have a released .ckpt
+                    there — filenames are "{32,72,144}_{with,without}_midattn
+                    .ckpt" (no "144_with_midattn.ckpt" exists) — plus "_mlp"
+                    ("finalmlp") tar.bz2 archives for the two-extra-post-
+                    fusion-MLP variant. There is no --model-size flag: the
+                    architecture is always read from the sibling
+                    "<checkpoint-stem>_model_config.json" Dataverse ships next
+                    to every .ckpt (e.g. 144_without_midattn.ckpt requires
+                    144_without_midattn_model_config.json in the same
+                    directory) — the script errors if that file is missing.
+                    vocab_size is separately inferred from the checkpoint's
+                    own embed_tokens.weight shape.
 
 Model sizes
-  JanusDNA has no "small/base/large" parameter tiers the way DNABERT-2 or Evo2
-  do. The paper/repo instead release 8-layer checkpoints at 3 hidden_size
-  values (32/72/144), each optionally with a periodic mid-stack attention
-  sublayer ("midattn") switched on or off — 5 released configs in total (no
-  144dim+midattn checkpoint). An August 2025 update additionally offers the
-  32dim configs with two extra MLP layers after the fusion point ("_mlp") and
-  an optional reverse-complement-augmented ("rc") variant. Use --model-size to
-  select one of the 5 base architectures (see MODEL_PRESETS for exact dims and
-  the approximate published parameter counts for the two sizes that reported
-  one: ~2M for 32dim, ~7.7M for 72dim; 144dim's count isn't published).
 
-Why only single, pre-fusion layers are safe to extract
-  JanusDNA reads each input twice — once forward, once with the token order
-  reversed (NOT reverse-complemented; the flip is only in reading direction,
-  applied to the same forward-strand embedding) — concatenated along the
-  sequence axis into one 2L-length tensor. For every *released* checkpoint
-  (layer_fusion=False, confirmed in configs/model/janusdna.yaml and every
-  scripts/pre_train/*.sh), each of the num_hidden_layers decoder layers
-  (BiJanusDNAMambaSeperateWrapper / BiJanusDNAAttentionWrapper in
-  janusdna/modeling_janusdna.py) keeps the forward half and the
-  reversed-reading half on entirely separate weights and only concatenates
-  them back together — no mixing. The forward and reversed streams are joined
-  exactly once, in a dedicated FinalAttention (flex-attention) fusion module
-  that runs *after* the last decoder layer, followed by final_fusion() and
-  final_mlp(). So any --layer index in [0, num_hidden_layers) is a clean,
-  unmerged single-direction representation; this script never calls
-  final_attention at all (it raises out of the forward pass right after the
-  last requested hook fires), so it also sidesteps needing a working
-  torch.compile'd flex_attention. (A hypothetical layer_fusion=True checkpoint
-  *would* mix directions at every layer via BiJanusDNAMambaWrapper instead —
-  none of the released checkpoints use this, but if you ever load one, no
-  layer is safe to extract from.)
+    preset              activated params   pretraining context length
+    32dim_midattn       ~0.42M             1,024 bp
+    32dim_nomidattn     ~0.43M             1,024 bp
+    72dim_midattn       ~1.98M             1,024 bp
+    72dim_nomidattn     ~1.99M             1,024 bp
+    144dim_nomidattn    ~7.66M             131,072 bp
+
+  If your checkpoint's config doesn't match any of these (e.g. a custom
+  fine-tune), the script can't determine its context length and skips that
+  warning, using a generic "{hidden_size}dim" output-folder label instead.
+
 
 Input
   --ref-file       Reference sequences .npy. Default: output/ref_seq_DNA_forward.npy
@@ -93,8 +83,8 @@ Pooling
                     Default: output/variant_meta.csv.
 
 Output
-  Saved under embeddings/JanusDNA_{model-size}_{context_window}_emb/, e.g.
-  JanusDNA_72dim_nomidattn_2500bp_emb/ (context_window is parsed from the
+  Saved under embeddings/JanusDNA_{preset-or-hidden_size}_{context_window}_emb/,
+  e.g. JanusDNA_72dim_nomidattn_2500bp_emb/ (context_window is parsed from the
   input filename — e.g. ref_seq_DNA_forward_2500bp.npy — so the
   --ref-file/--variant-meta-file name must contain a "<N>bp" token).
   One {ref_seq,mut_seq}_L{layer}_{direction}_{emb_type}_{strand}[_ds{k}].npy
@@ -104,8 +94,7 @@ Example
 -------
 python extract_embeddings_JanusDNA.py \\
     --janusdna-repo /path/to/JanusDNA \\
-    --checkpoint /path/to/janusdna_72dim_nomidattn.pt \\
-    --model-size 72dim_nomidattn \\
+    --checkpoint /path/to/72_without_midattn.ckpt \\
     --layer 6 7 \\
     --ref-file output/20260831_143505/ref_seq_DNA_forward_2500bp.npy \\
     --mut-file output/20260831_143505/mut_seq_DNA_forward_2500bp.npy
@@ -122,6 +111,10 @@ import pandas as pd
 import torch
 
 from embedding_utils import parse_context_window, parse_downstream_k, pool, pool_downstream
+from janusdna_utils import (
+    MODEL_PRESETS, N_LAYER, PAD_ID,
+    build_config, find_sibling_config_json, infer_preset_key, infer_vocab_size, load_checkpoint, tokenize,
+)
 
 DEVICE = (
     "cuda" if torch.cuda.is_available()
@@ -129,36 +122,10 @@ DEVICE = (
     else "cpu"
 )
 
-# hidden_size / intermediate_size / flex_attn_n_embd / attn_layer_offset come
-# straight from scripts/pre_train/slurm_JanusDNA_*.sh; attn_layer_offset=100
-# (vs. attn_layer_period=8) is how the "nomidattn" runs disable the periodic
-# mid-stack attention sublayer entirely (i % 8 never equals 100), leaving all
-# 8 layers as plain Mamba+MoE. params_label is the size self-reported in
-# JanusDNA's README benchmark tables where published; "unpublished" otherwise.
-MODEL_PRESETS = {
-    "32dim_midattn":    dict(hidden_size=32,  intermediate_size=128, flex_attn_n_embd=64,  attn_layer_offset=4,   params_label="~1.98M"),
-    "32dim_nomidattn":  dict(hidden_size=32,  intermediate_size=128, flex_attn_n_embd=64,  attn_layer_offset=100, params_label="~1.99M"),
-    "72dim_midattn":    dict(hidden_size=72,  intermediate_size=288, flex_attn_n_embd=128, attn_layer_offset=4,   params_label="~7.66M"),
-    "72dim_nomidattn":  dict(hidden_size=72,  intermediate_size=288, flex_attn_n_embd=128, attn_layer_offset=100, params_label="~7.75M"),
-    "144dim_nomidattn": dict(hidden_size=144, intermediate_size=576, flex_attn_n_embd=256, attn_layer_offset=100, params_label="unpublished"),
-}
-N_LAYER = 8  # fixed across every released checkpoint
-
-# CharacterTokenizer scheme from src/dataloaders/datasets/hg38_char_tokenizer.py
-# (characters=['A','C','G','T','N'], ids assigned after 7 reserved specials).
-SPECIAL_IDS = {"[CLS]": 0, "[SEP]": 1, "[BOS]": 2, "[MASK]": 3, "[PAD]": 4, "[RESERVED]": 5, "[UNK]": 6}
-CHAR_IDS = {"A": 7, "C": 8, "G": 9, "T": 10, "N": 11}
-PAD_ID = SPECIAL_IDS["[PAD]"]
-UNK_ID = SPECIAL_IDS["[UNK]"]
-
 
 class _StopForward(Exception):
     """Raised from the last requested layer's hook to skip the (unneeded,
     expensive) final-fusion attention and everything after it."""
-
-
-def tokenize(seq: str) -> list[int]:
-    return [CHAR_IDS.get(base, UNK_ID) for base in seq.upper()]
 
 
 def build_filename(layer: int, direction: str, mode: str, strand: str, region_suffix: str = "") -> str:
@@ -186,73 +153,6 @@ def pool_upstream(hidden: torch.Tensor, lengths: list[int], starts: list[int], k
     return (hidden * mask_expanded).sum(1) / mask_expanded.sum(1).clamp(min=1)
 
 
-def build_config(model_size: str, vocab_size: int, JanusDNAConfig):
-    p = MODEL_PRESETS[model_size]
-    config = JanusDNAConfig(
-        vocab_size=vocab_size,
-        hidden_size=p["hidden_size"],
-        intermediate_size=p["intermediate_size"],
-        num_hidden_layers=N_LAYER,
-        num_attention_heads=4,
-        attn_layer_period=8,
-        attn_layer_offset=p["attn_layer_offset"],
-        expert_layer_period=2,
-        expert_layer_offset=1,
-        flex_attn_n_embd=p["flex_attn_n_embd"],
-        bidirectional=True,
-        bidirectional_strategy="add",
-        bidirectional_weight_tie=True,
-        bidirectional_attn_tie=False,
-        layer_fusion=False,  # every released checkpoint — see module docstring
-        final_attention=True,
-        layer_fusion_strategy="pool",
-        mid_single_direction_attention=True,
-        final_attention_class="flex_attention",
-        use_cache=False,
-        gradient_checkpointing=False,
-    )
-    # Only used by final_attention (never invoked — see _StopForward), and by
-    # mid-stack attention sublayers on *_midattn presets. sdpa avoids needing
-    # flash-attn / a working torch.compile'd flex_attention just to hook
-    # earlier layers.
-    config._attn_implementation = "sdpa"
-    return config
-
-
-def load_checkpoint(model, checkpoint_path: str) -> None:
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-
-    model_keys = set(model.state_dict().keys())
-    if not (set(state_dict.keys()) & model_keys):
-        # Common wrapper prefixes (e.g. Lightning's "model.model." or
-        # DNAEmbeddingModelJanusDNA's "model.") — strip until keys line up.
-        for prefix in ("model.model.", "model."):
-            stripped = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
-            if set(stripped.keys()) & model_keys:
-                state_dict = stripped
-                break
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"Loaded checkpoint {checkpoint_path}: {len(missing)} missing keys, {len(unexpected)} unexpected keys.")
-    if missing:
-        print(f"  missing (first 5): {missing[:5]}")
-    if unexpected:
-        print(f"  unexpected (first 5): {unexpected[:5]}")
-
-
-def infer_vocab_size(checkpoint_path: str) -> int:
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    for key, tensor in state_dict.items():
-        if key.endswith("embed_tokens.weight"):
-            return tensor.shape[0]
-    default = len(SPECIAL_IDS) + len(CHAR_IDS)
-    print(f"WARNING: could not find embed_tokens.weight in checkpoint to infer vocab_size; "
-          f"defaulting to {default}.")
-    return default
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract JanusDNA embeddings from DNA sequences.",
@@ -262,9 +162,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--janusdna-repo", required=True,
                         help="Path to a local clone of github.com/Qihao-Duan/JanusDNA (for its `janusdna` package).")
     parser.add_argument("--checkpoint", required=True,
-                        help="Path to a local pretrained-weights file (see module docstring).")
-    parser.add_argument("--model-size", default="72dim_nomidattn", choices=list(MODEL_PRESETS),
-                        help="Architecture preset (default: 72dim_nomidattn). See MODEL_PRESETS.")
+                        help="Path to a local pretrained-weights file — requires a sibling "
+                             "'<checkpoint-stem>_model_config.json' in the same directory (see module "
+                             "docstring). No --model-size flag: architecture is read from that file.")
     parser.add_argument("--layer", nargs="+", type=int, default=[N_LAYER - 1],
                         help=f"Decoder-layer indices (0-indexed, valid range [0, {N_LAYER})) to extract "
                              f"together in one forward pass. Default: {N_LAYER - 1} (last layer).")
@@ -396,8 +296,16 @@ if __name__ == "__main__":
 
     print(f"Using device: {DEVICE}")
     vocab_size = infer_vocab_size(args.checkpoint)
-    config = build_config(args.model_size, vocab_size, JanusDNAConfig)
-    print(f"Building JanusDNAModel ({args.model_size}, vocab_size={vocab_size}) ...")
+    config_json = find_sibling_config_json(args.checkpoint)
+    if config_json is None:
+        sys.exit(
+            f"ERROR: no sibling '<checkpoint-stem>_model_config.json' found next to {args.checkpoint!r} "
+            "— place the config JSON Dataverse ships with this checkpoint in the same directory."
+        )
+    config = build_config(vocab_size, JanusDNAConfig, config_json)
+    preset_key = infer_preset_key(config)
+    label = preset_key or f"{config.hidden_size}dim"
+    print(f"Building JanusDNAModel ({label}, vocab_size={vocab_size}) ...")
     model = JanusDNAModel(config).to(DEVICE).eval()
     load_checkpoint(model, args.checkpoint)
     print("Model loaded.\n")
@@ -408,7 +316,21 @@ if __name__ == "__main__":
     }
 
     context_window = parse_context_window(input_files["ref_seq"])
-    out_dir = os.path.join("embeddings", f"JanusDNA_{args.model_size}_{context_window}_emb")
+    out_dir = os.path.join("embeddings", f"JanusDNA_{label}_{context_window}_emb")
+
+    if preset_key is None:
+        print(f"NOTE: {label} doesn't match a known preset in MODEL_PRESETS, so its pretraining "
+              "context length is unknown — skipping the out-of-distribution window-length check.")
+    else:
+        pretrain_context_length = MODEL_PRESETS[preset_key]["context_length"]
+        window_bp = int(context_window.rstrip("bp"))
+        if window_bp > pretrain_context_length:
+            warnings.warn(
+                f"--ref-file windows are {window_bp} bp, but {label} was pretrained at only "
+                f"{pretrain_context_length} bp context — embeddings from windows this much longer than "
+                f"pretraining are out-of-distribution for this checkpoint. Use 144dim_nomidattn "
+                f"(pretrained at 131,072 bp) for long windows."
+            )
 
     edit_start = ref_len = alt_len = None
     if args.pool_region == "downstream":
