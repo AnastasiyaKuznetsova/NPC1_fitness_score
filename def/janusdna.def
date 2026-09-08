@@ -12,8 +12,14 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 #     the very first op. cu128 is the first PyTorch wheel index with
 #     Blackwell kernels baked in; if your GPU is Ampere/Hopper or older,
 #     this build still works, just newer than strictly required.
-#   - Prebuilt CUDA wheels for mamba_ssm, causal-conv1d, flash-attn
-#     (matching cu12 / torch2.8 / cp311 — no source compilation needed)
+#   - mamba_ssm / causal-conv1d built FROM SOURCE against the installed
+#     torch (not a prebuilt wheel — see below for why), targeting Ampere/
+#     Hopper/Blackwell (sm_80/86/90/120) so the same .sif runs on any of
+#     them. flash-attn is skipped entirely: modeling_janusdna.py imports it
+#     in a try/except ImportError and only uses it if config._attn_implementation
+#     == "flash_attention_2", but extract_embeddings_JanusDNA.py's build_config()
+#     always forces "sdpa" — so it's dead weight (and it's the slowest and
+#     most fragile of the three to get an exact ABI match for).
 #   - The small set of pure-Python deps actually imported by
 #     janusdna/{modeling,configuration}_janusdna.py at runtime (transformers,
 #     wandb — modeling_janusdna.py imports it unconditionally even though we
@@ -66,30 +72,19 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
         torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
         --index-url https://download.pytorch.org/whl/cu128
 
-    # ---- Prebuilt CUDA extension wheels --------------------------------------
-    # These match cu12 / torch2.8 / cxx11abiTRUE / cp311 — the exact ABI of
-    # the PyTorch pip wheels above (PyTorch switched its default ABI to
-    # cxx11abiTRUE around the 2.6/2.7 line), so no nvcc compilation is needed.
-    MAMBA_WHL="https://github.com/state-spaces/mamba/releases/download/v2.3.2.post1/mamba_ssm-2.3.2.post1+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
-    CONV1D_WHL="https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
-    FLASH_WHL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
-
-    pip install --no-cache-dir --no-deps "$CONV1D_WHL"
-    pip install --no-cache-dir --no-deps "$MAMBA_WHL"
-    pip install --no-cache-dir --no-deps "$FLASH_WHL"
-
-    # ---- Runtime deps of the wheels above (installed --no-deps, so their own
-    # ---- pure-Python deps need pinning here) + what janusdna's modeling/config
-    # ---- code and extract_embeddings_JanusDNA.py actually import. omegaconf/
-    # ---- hydra-core/pytorch-lightning are needed to unpickle the released
-    # ---- .ckpt files themselves (torch.load has to import whatever classes
-    # ---- were pickled into the checkpoint by JanusDNA's Hydra+Lightning
-    # ---- training pipeline, even though we only read out the state_dict).
-    # ---- Versions match JanusDNA's own janusdna.yml.
+    # ---- Build-time deps needed before compiling mamba_ssm/causal-conv1d ------
+    # (their setup.py imports packaging/ninja/einops/psutil at build time) +
+    # everything else janusdna's modeling/config code and
+    # extract_embeddings_JanusDNA.py import at runtime. omegaconf/hydra-core/
+    # pytorch-lightning are needed to unpickle the released .ckpt files
+    # themselves (torch.load has to import whatever classes were pickled into
+    # the checkpoint by JanusDNA's Hydra+Lightning training pipeline, even
+    # though we only read out the state_dict). Versions match janusdna.yml.
     pip install --no-cache-dir \
         einops==0.8.0 \
         packaging==24.2 \
         ninja==1.11.1.3 \
+        psutil \
         triton==3.1.0 \
         transformers==4.49.0 \
         wandb==0.19.6 \
@@ -98,6 +93,24 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
         omegaconf==2.3.0 \
         hydra-core==1.3.2 \
         pytorch-lightning==2.5.0.post0
+
+    # ---- mamba_ssm / causal-conv1d, compiled from source ----------------------
+    # Prebuilt wheels are tagged by torch MINOR version only (e.g.
+    # "cu12torch2.8"), but their compiled .so links against specific internal
+    # libtorch C++ symbols (c10::cuda::SetDevice, etc.) that can differ across
+    # patch builds — a wheel built against a torch2.8 dev/rc snapshot can fail
+    # with "undefined symbol" against the official 2.8.0 stable release
+    # installed above. Building from source compiles against the exact
+    # installed torch, avoiding that entirely. TORCH_CUDA_ARCH_LIST covers
+    # Ampere/Hopper/Blackwell so the same .sif runs on any of them; this makes
+    # the build noticeably slower (compiling multiple archs) but is a one-time
+    # cost. *_FORCE_BUILD=TRUE stops their setup.py from trying to fetch a
+    # prebuilt wheel itself.
+    export TORCH_CUDA_ARCH_LIST="8.0 8.6 9.0 12.0+PTX"
+    export CAUSAL_CONV1D_FORCE_BUILD=TRUE
+    export MAMBA_FORCE_BUILD=TRUE
+    pip install --no-cache-dir --no-build-isolation causal-conv1d==1.7.0
+    pip install --no-cache-dir --no-build-isolation mamba-ssm==2.3.2.post1
 
     # selene-sdk is installed without deps, per the JanusDNA README
     pip install --no-cache-dir selene-sdk --no-deps
@@ -126,12 +139,8 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
     python - <<'PY'
 import torch, mamba_ssm, causal_conv1d
 print("torch:", torch.__version__, "| CUDA build:", torch.version.cuda)
-try:
-    import flash_attn
-    print("flash_attn:", flash_attn.__version__)
-except Exception as e:
-    print("flash_attn import note:", e)
-print("mamba_ssm + causal_conv1d import OK")
+print("torch arch list:", torch.cuda.get_arch_list())
+print("mamba_ssm + causal_conv1d import OK (built from source, no flash-attn — see module docstring)")
 print("CUDA available at test time:", torch.cuda.is_available())
 
 # Actually import the janusdna package extract_embeddings_JanusDNA.py needs,
@@ -163,9 +172,10 @@ PY
 
     Notes:
       * Requires an NVIDIA GPU + driver on the host; pass --nv.
-      * Built with cu128 for Blackwell GPU support (sm_100/sm_120, e.g. RTX
-        PRO 6000 Blackwell) — also works on Ampere/Hopper GPUs. Check your
-        GPU's compute capability with:
+      * mamba_ssm/causal-conv1d are compiled from source at build time
+        targeting Ampere/Hopper/Blackwell (sm_80/86/90/120), so the same
+        .sif runs on any of them — no flash-attn (unused, see module
+        docstring). Check your GPU's compute capability with:
             apptainer exec --nv janusdna.sif nvidia-smi --query-gpu=name,compute_cap --format=csv
       * JanusDNA source is at /opt/JanusDNA (already on PYTHONPATH).
       * Download pretrained weights from the Harvard Dataverse link in the
