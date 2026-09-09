@@ -53,7 +53,25 @@ Input
                     windows from prepare_dataset.py); the script warns and
                     still pads (unmasked) if lengths differ within a batch.
 
-Layers / direction
+Extraction point
+  --extract-from   'fusion' (default): the fully bidirectional representation
+                    AFTER JanusDNA's final-fusion attention — every position
+                    has already seen the whole sequence (both directions),
+                    which is what you want for training a downstream
+                    variant-effect predictor on top of these embeddings.
+                    'layer': the older pre-fusion, single-direction mode (see
+                    "Why only single, pre-fusion layers are safe to extract"
+                    below) — use this if you specifically want an unmerged
+                    forward- or backward-only representation instead.
+                    NOTE: 'fusion' always runs FinalAttention, which uses
+                    torch.compile'd flex_attention regardless of the sdpa
+                    override elsewhere in this script — 'layer' mode never
+                    reaches that (it stops the forward pass right after the
+                    last requested decoder layer), so this is a real new
+                    requirement 'fusion' introduces: a GPU/triton setup where
+                    flex_attention actually compiles and runs.
+
+Layers / direction (only used with --extract-from layer)
   --layer          One or more decoder-layer indices (0-indexed into
                     model.layers), extracted together in a single forward
                     pass. Default: last layer (num_hidden_layers - 1).
@@ -67,7 +85,13 @@ Layers / direction
 Pooling
   --pool-region    'full' (default): pool over the whole sequence.
                     'downstream': pool only positions after the edit — requires
-                    --variant-meta-file.
+                    --variant-meta-file. With --extract-from fusion, "start"
+                    always uses the forward-style position (the allele's own
+                    last base) since there's no separate direction there —
+                    every fused position has already seen the whole sequence
+                    anyway, so this is just a locality window around the edit,
+                    not an isolation of "hasn't seen it yet" the way it is for
+                    --extract-from layer.
   --emb-type       'average': mean over the pooled region. 'last': last token —
                     only valid with --pool-region full. Default: average.
   --downstream-k   Only used with --pool-region downstream. One or more window
@@ -87,14 +111,24 @@ Output
   e.g. JanusDNA_72dim_nomidattn_2500bp_emb/ (context_window is parsed from the
   input filename — e.g. ref_seq_DNA_forward_2500bp.npy — so the
   --ref-file/--variant-meta-file name must contain a "<N>bp" token).
-  One {ref_seq,mut_seq}_L{layer}_{direction}_{emb_type}_{strand}[_ds{k}].npy
-  per layer (and per k, if swept), shape (N, D).
+  --extract-from fusion: one {ref_seq,mut_seq}_Lfusion_{emb_type}_{strand}
+  [_ds{k}].npy (per k, if swept), shape (N, D).
+  --extract-from layer: one {ref_seq,mut_seq}_L{layer}_{direction}_{emb_type}
+  _{strand}[_ds{k}].npy per layer (and per k, if swept), shape (N, D).
 
 Example
 -------
 python extract_embeddings_JanusDNA.py \\
     --janusdna-repo /path/to/JanusDNA \\
     --checkpoint /path/to/72_without_midattn.ckpt \\
+    --ref-file output/20260831_143505/ref_seq_DNA_forward_2500bp.npy \\
+    --mut-file output/20260831_143505/mut_seq_DNA_forward_2500bp.npy
+
+# Or the older pre-fusion, single-direction mode:
+python extract_embeddings_JanusDNA.py \\
+    --janusdna-repo /path/to/JanusDNA \\
+    --checkpoint /path/to/72_without_midattn.ckpt \\
+    --extract-from layer \\
     --layer 6 7 \\
     --ref-file output/20260831_143505/ref_seq_DNA_forward_2500bp.npy \\
     --mut-file output/20260831_143505/mut_seq_DNA_forward_2500bp.npy
@@ -165,12 +199,18 @@ def parse_args() -> argparse.Namespace:
                         help="Path to a local pretrained-weights file — requires a sibling "
                              "'<checkpoint-stem>_model_config.json' in the same directory (see module "
                              "docstring). No --model-size flag: architecture is read from that file.")
+    parser.add_argument("--extract-from", default="fusion", choices=["fusion", "layer"],
+                        help="'fusion' (default): the fully bidirectional post-fusion representation "
+                             "— use this for training a variant-effect predictor. 'layer': the older "
+                             "pre-fusion, single-direction mode (--layer/--direction). See module docstring.")
     parser.add_argument("--layer", nargs="+", type=int, default=[N_LAYER - 1],
-                        help=f"Decoder-layer indices (0-indexed, valid range [0, {N_LAYER})) to extract "
-                             f"together in one forward pass. Default: {N_LAYER - 1} (last layer).")
+                        help=f"Only used with --extract-from layer. Decoder-layer indices (0-indexed, "
+                             f"valid range [0, {N_LAYER})) to extract together in one forward pass. "
+                             f"Default: {N_LAYER - 1} (last layer).")
     parser.add_argument("--direction", default="forward", choices=["forward", "backward"],
-                        help="'forward' (default): causal left-to-right reading. 'backward': causal "
-                             "reading of the reversed sequence, flipped back to original base order.")
+                        help="Only used with --extract-from layer. 'forward' (default): causal "
+                             "left-to-right reading. 'backward': causal reading of the reversed "
+                             "sequence, flipped back to original base order.")
     parser.add_argument("--strand", default="forward", choices=["forward", "reverse"],
                         help="Genomic strand of the input --ref-file/--mut-file — selects the default "
                              "input files and labels output. Default: forward. (Not to be confused with "
@@ -203,6 +243,64 @@ def parse_args() -> argparse.Namespace:
         if not (0 <= layer < N_LAYER):
             parser.error(f"--layer {layer} out of range [0, {N_LAYER})")
     return args
+
+
+def extract_fusion_embeddings(
+    sequences: list,
+    model,
+    df: str,
+    emb_type: str,
+    strand: str,
+    out_dir: str,
+    batch_size: int,
+    pool_region: str,
+    downstream_ks: list = None,
+    edit_starts: list = None,
+) -> None:
+    """--extract-from fusion: the model's own final hidden_states — already
+    run through final-fusion attention, final_fusion() and final_mlp(), so
+    it's a single length-L, fully bidirectional representation per position
+    (JanusDNAModel.forward(..., return_dict=False) returns (hidden_states,
+    moe_loss); no hooks/_StopForward needed, just let the forward pass run
+    to completion)."""
+    os.makedirs(out_dir, exist_ok=True)
+    regions = downstream_ks if pool_region == "downstream" else [None]
+    all_pooled = {r: [] for r in regions}
+
+    for start in range(0, len(sequences), batch_size):
+        seqs = [str(s) for s in sequences[start:start + batch_size]]
+        token_ids = [tokenize(s) for s in seqs]
+        lengths = [len(t) for t in token_ids]
+        max_length = max(lengths)
+        if len(set(lengths)) > 1:
+            warnings.warn(
+                "Batch has sequences of different lengths — padding is not masked out in JanusDNA's "
+                "Mamba layers, so shorter sequences' representations may be affected by padding. "
+                "Use --batch-size 1 (default) if this matters."
+            )
+        padded = [t + [PAD_ID] * (max_length - len(t)) for t in token_ids]
+        input_ids = torch.tensor(padded, dtype=torch.long, device=DEVICE)
+        batch_starts = edit_starts[start:start + batch_size] if pool_region == "downstream" else None
+
+        with torch.no_grad():
+            hidden, _ = model(input_ids, return_dict=False)  # (B, max_length, D), already fused
+
+        for r in regions:
+            pooled = (pool_downstream(hidden, lengths, batch_starts, r)
+                      if pool_region == "downstream" else pool(hidden, lengths, emb_type))
+            all_pooled[r].append(pooled.float().cpu().numpy())
+
+        print(f"Processed {min(start + batch_size, len(sequences))}/{len(sequences)} sequences")
+
+    for r in regions:
+        combined = np.concatenate(all_pooled[r], axis=0)
+        region_suffix = "" if r is None else f"ds{r}"
+        suffix = f"_{region_suffix}" if region_suffix else ""
+        fname = f"Lfusion_{emb_type}_{strand}{suffix}.npy"
+        out_path = os.path.join(out_dir, f"{df}_{fname}")
+        np.save(out_path, combined)
+        print(f"Saved {emb_type} fusion embeddings region={region_suffix or 'full'}: "
+              f"{combined.shape} -> {out_path}")
 
 
 def extract_embeddings(
@@ -346,7 +444,9 @@ if __name__ == "__main__":
         if args.pool_region == "downstream":
             allele_len = ref_len if df == "ref_seq" else alt_len
             seq_lens = np.array([len(s) for s in seqs])
-            if args.direction == "forward":
+            # --extract-from fusion has no separate direction, so it always
+            # uses the forward-style position (see --pool-region help).
+            if args.extract_from == "fusion" or args.direction == "forward":
                 # earliest position whose forward-causal context has fully seen
                 # the allele = the allele's own last base, in this array's own
                 # left-to-right order.
@@ -367,17 +467,31 @@ if __name__ == "__main__":
                 else:
                     starts = (seq_lens - edit_start - allele_len).tolist()
 
-        extract_embeddings(
-            sequences=seqs,
-            model=model,
-            df=df,
-            emb_type=args.emb_type,
-            layers=args.layer,
-            direction=args.direction,
-            strand=args.strand,
-            out_dir=out_dir,
-            batch_size=args.batch_size,
-            pool_region=args.pool_region,
-            downstream_ks=args.downstream_k,
-            edit_starts=starts,
-        )
+        if args.extract_from == "fusion":
+            extract_fusion_embeddings(
+                sequences=seqs,
+                model=model,
+                df=df,
+                emb_type=args.emb_type,
+                strand=args.strand,
+                out_dir=out_dir,
+                batch_size=args.batch_size,
+                pool_region=args.pool_region,
+                downstream_ks=args.downstream_k,
+                edit_starts=starts,
+            )
+        else:
+            extract_embeddings(
+                sequences=seqs,
+                model=model,
+                df=df,
+                emb_type=args.emb_type,
+                layers=args.layer,
+                direction=args.direction,
+                strand=args.strand,
+                out_dir=out_dir,
+                batch_size=args.batch_size,
+                pool_region=args.pool_region,
+                downstream_ks=args.downstream_k,
+                edit_starts=starts,
+            )
