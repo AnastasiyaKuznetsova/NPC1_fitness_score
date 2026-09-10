@@ -80,12 +80,18 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
     # themselves (torch.load has to import whatever classes were pickled into
     # the checkpoint by JanusDNA's Hydra+Lightning training pipeline, even
     # though we only read out the state_dict). Versions match janusdna.yml.
+    # triton==3.4.0, not janusdna.yml's 3.1.0: torch==2.8.0's own PyPI metadata
+    # requires triton==3.4.0 exactly, and mamba-ssm==2.3.2.post1's Mamba-3
+    # module (new since 2.2.4) calls triton.set_allocator(), which doesn't
+    # exist before triton 3.3.0 — 3.1.0 fails with
+    # "AttributeError: module 'triton' has no attribute 'set_allocator'".
+    # janusdna.yml's 3.1.0 pin was correct only for its own torch==2.5.0.
     pip install --no-cache-dir \
         einops==0.8.0 \
         packaging==24.2 \
         ninja==1.11.1.3 \
         psutil \
-        triton==3.1.0 \
+        triton==3.4.0 \
         transformers==4.49.0 \
         wandb==0.19.6 \
         numpy==1.26.0 \
@@ -106,7 +112,7 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
     # KNOWN DEVIATION FROM UPSTREAM: JanusDNA's own README pins mamba_ssm to
     # 2.2.4 (a prebuilt cu12/torch2.5 wheel) and janusdna.yml pins
     # causal-conv1d to 1.5.0.post8 — both older than what's installed below
-    # (2.3.2.post1 / 1.7.0). This isn't optional: checked each version's
+    # (2.3.1 / 1.7.0). This isn't optional: checked each version's
     # setup.py directly — 2.2.4 / 1.5.0.post8 only emit -gencode flags up to
     # sm_90 (Hopper), with no sm_100/sm_120 (Blackwell) case at all, so they
     # CANNOT target Blackwell regardless of CUDA toolkit version. The
@@ -142,8 +148,21 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
     # "undefined symbol: ...c10_cuda_check_implementation..." at import.
     # Their other runtime deps (einops, packaging, ninja, psutil, triton) are
     # already installed above, so --no-deps here doesn't lose anything.
+    #
+    # mamba-ssm==2.3.1, not the newer 2.3.2.post1: 2.3.2 added a "Mamba-3"
+    # module that mamba_ssm/__init__.py imports unconditionally, and that
+    # module calls triton.set_allocator() (needs triton>=3.3.0, and
+    # mamba-ssm 2.3.2.post1's own install_requires wants triton>=3.5.0) —
+    # but torch==2.8.0 itself pins triton==3.4.0 exactly, so 3.5.0+ and
+    # torch's own pin can't both be satisfied. JanusDNA's modeling_janusdna.py
+    # only ever imports mamba_ssm.ops.selective_scan_interface (Mamba1/2
+    # kernels) — Mamba-3 is unused dead weight here, same as flash-attn.
+    # 2.3.1 (one release before Mamba-3 landed) doesn't import mamba3 at all,
+    # has no triton version floor, and still has the same sm_100/sm_120
+    # Blackwell gencode gating in its setup.py as 2.3.2.post1 — so this loses
+    # nothing needed here while sidestepping the triton conflict entirely.
     pip install --no-cache-dir --no-build-isolation --no-deps causal-conv1d==1.7.0
-    pip install --no-cache-dir --no-build-isolation --no-deps mamba-ssm==2.3.2.post1
+    pip install --no-cache-dir --no-build-isolation --no-deps mamba-ssm==2.3.1
 
     # selene-sdk is installed without deps, per the JanusDNA README
     pip install --no-cache-dir selene-sdk --no-deps
