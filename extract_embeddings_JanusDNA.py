@@ -147,7 +147,8 @@ import torch
 from embedding_utils import parse_context_window, parse_downstream_k, pool, pool_downstream
 from janusdna_utils import (
     MODEL_PRESETS, N_LAYER, PAD_ID,
-    build_config, find_sibling_config_json, infer_preset_key, infer_vocab_size, load_checkpoint, tokenize,
+    build_config, find_sibling_config_json, infer_preset_key, infer_vocab_size, load_checkpoint,
+    patch_janusdna_causal_mask_bug, tokenize,
 )
 
 DEVICE = (
@@ -389,8 +390,10 @@ if __name__ == "__main__":
     args = parse_args()
 
     sys.path.insert(0, args.janusdna_repo)
+    import janusdna.modeling_janusdna as modeling_janusdna
     from janusdna.configuration_janusdna import JanusDNAConfig
     from janusdna.modeling_janusdna import JanusDNAModel
+    patch_janusdna_causal_mask_bug(modeling_janusdna)
 
     print(f"Using device: {DEVICE}")
     vocab_size = infer_vocab_size(args.checkpoint)

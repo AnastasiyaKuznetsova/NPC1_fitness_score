@@ -123,6 +123,33 @@ def load_checkpoint(model, checkpoint_path: str) -> None:
         print(f"  unexpected (first 5): {unexpected[:5]}")
 
 
+def patch_janusdna_causal_mask_bug(modeling_janusdna) -> None:
+    """Monkeypatches a bug in JanusDNAModel._update_causal_mask (upstream
+    github.com/Qihao-Duan/JanusDNA, commit 4f0cecb). With sdpa/eager
+    attn_implementation it unconditionally builds an explicit causal mask
+    sized to the full concatenated fwd+bwd hidden_states (2x seq_len), even
+    when no attention_mask was passed in to model.forward(). Each decoder
+    layer's BiJanusDNAAttentionWrapper then splits hidden_states back into
+    fwd/bwd halves but passes that oversized mask through unchanged (only
+    slicing its key dimension) — the query dimension stays at 2x seq_len,
+    so scaled_dot_product_attention raises "expanded size ... must match
+    existing size" (e.g. 1024 vs 2048). Only hits with_midattn checkpoints
+    (mid-stack attention layers) with _attn_implementation sdpa/eager and no
+    attention_mask passed in — the flash_attention_2/flex_attention branches
+    already return None correctly in that case. This skips building the
+    mask entirely so each direction's self_attn falls back to its own
+    is_causal=True SDPA path, which is what an absent attention_mask means
+    anyway."""
+    original = modeling_janusdna.JanusDNAModel._update_causal_mask
+
+    def patched(self, attention_mask, input_tensor, cache_position):
+        if attention_mask is None and self.config._attn_implementation in ("sdpa", "eager"):
+            return None
+        return original(self, attention_mask, input_tensor, cache_position)
+
+    modeling_janusdna.JanusDNAModel._update_causal_mask = patched
+
+
 def infer_vocab_size(checkpoint_path: str) -> int:
     # weights_only=False: these .ckpt files were pickled by JanusDNA's own
     # Hydra+Lightning training pipeline and contain non-tensor classes (e.g.
