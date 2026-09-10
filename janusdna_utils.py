@@ -96,7 +96,13 @@ def build_config(vocab_size: int, JanusDNAConfig, config_json: str):
 
 
 def load_checkpoint(model, checkpoint_path: str) -> None:
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    # weights_only=False: these .ckpt files were pickled by JanusDNA's own
+    # Hydra+Lightning training pipeline and contain non-tensor classes (e.g.
+    # omegaconf.listconfig.ListConfig) alongside the state_dict. torch>=2.6
+    # defaults torch.load to weights_only=True, which refuses to unpickle
+    # those — safe here since checkpoints come from JanusDNA's own Harvard
+    # Dataverse release, not an untrusted source.
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
 
     model_keys = set(model.state_dict().keys())
@@ -118,7 +124,13 @@ def load_checkpoint(model, checkpoint_path: str) -> None:
 
 
 def infer_vocab_size(checkpoint_path: str) -> int:
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    # weights_only=False: these .ckpt files were pickled by JanusDNA's own
+    # Hydra+Lightning training pipeline and contain non-tensor classes (e.g.
+    # omegaconf.listconfig.ListConfig) alongside the state_dict. torch>=2.6
+    # defaults torch.load to weights_only=True, which refuses to unpickle
+    # those — safe here since checkpoints come from JanusDNA's own Harvard
+    # Dataverse release, not an untrusted source.
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
     for key, tensor in state_dict.items():
         if key.endswith("embed_tokens.weight"):
