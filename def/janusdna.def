@@ -101,7 +101,23 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
     # patch builds — a wheel built against a torch2.8 dev/rc snapshot can fail
     # with "undefined symbol" against the official 2.8.0 stable release
     # installed above. Building from source compiles against the exact
-    # installed torch, avoiding that entirely. TORCH_CUDA_ARCH_LIST covers
+    # installed torch, avoiding that entirely.
+    #
+    # KNOWN DEVIATION FROM UPSTREAM: JanusDNA's own README pins mamba_ssm to
+    # 2.2.4 (a prebuilt cu12/torch2.5 wheel) and janusdna.yml pins
+    # causal-conv1d to 1.5.0.post8 — both older than what's installed below
+    # (2.3.2.post1 / 1.7.0). This isn't optional: checked each version's
+    # setup.py directly — 2.2.4 / 1.5.0.post8 only emit -gencode flags up to
+    # sm_90 (Hopper), with no sm_100/sm_120 (Blackwell) case at all, so they
+    # CANNOT target Blackwell regardless of CUDA toolkit version. The
+    # versions installed below gate sm_100/sm_120 behind
+    # `bare_metal_version >= 12.8`, which this image's CUDA 12.8.1 satisfies.
+    # So pinning back to upstream's versions would silently drop Blackwell
+    # support, not just carry version risk. The one open question is
+    # numerical parity: these newer kernels are API-compatible with what
+    # JanusDNA's checkpoints were trained against, but haven't been verified
+    # to produce identical outputs — worth a sanity check against a known
+    # embedding if exact parity matters for your use case. TORCH_CUDA_ARCH_LIST covers
     # Ampere/Hopper/Blackwell so the same .sif runs on any of them; this makes
     # the build noticeably slower (compiling multiple archs) but is a one-time
     # cost. *_FORCE_BUILD=TRUE stops their setup.py from trying to fetch a
@@ -116,8 +132,18 @@ From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
     export CAUSAL_CONV1D_FORCE_BUILD=TRUE
     export MAMBA_FORCE_BUILD=TRUE
     export MAX_JOBS=2
-    pip install --no-cache-dir --no-build-isolation causal-conv1d==1.7.0
-    pip install --no-cache-dir --no-build-isolation mamba-ssm==2.3.2.post1
+    # --no-deps: both packages' setup.py declare install_requires=["torch", ...]
+    # with NO version pin. Without --no-deps, pip is free to resolve that bare
+    # "torch" however it likes for this install command and can silently pull
+    # a different torch build from PyPI (observed: it replaced the explicit
+    # torch==2.8.0+cu128 above with 2.14.0+cu130) — the extension then gets
+    # compiled against whichever torch is active at that moment, and if it's
+    # not the one active later at import time, you get an ABI mismatch like
+    # "undefined symbol: ...c10_cuda_check_implementation..." at import.
+    # Their other runtime deps (einops, packaging, ninja, psutil, triton) are
+    # already installed above, so --no-deps here doesn't lose anything.
+    pip install --no-cache-dir --no-build-isolation --no-deps causal-conv1d==1.7.0
+    pip install --no-cache-dir --no-build-isolation --no-deps mamba-ssm==2.3.2.post1
 
     # selene-sdk is installed without deps, per the JanusDNA README
     pip install --no-cache-dir selene-sdk --no-deps
