@@ -72,9 +72,10 @@ def extract_layer_pooling_combos(emb_dir: Path, strand: str) -> list[tuple[str, 
     combos = []
     for f in files:
         # Layer token is usually numeric (e.g. "_L27_") but can also be a name
-        # like "_Lfinal_" (DNABERT-2's last-layer embeddings have no layer index).
-        layer_m = re.search(r"_L(\d+|final)_", f.name)
-        pool_m  = re.search(r"_L(?:\d+|final)_(average|last)_", f.name)
+        # like "_Lfinal_" (DNABERT-2's last-layer embeddings have no layer index)
+        # or "_Lfusion_" (JanusDNA's --extract-from fusion post-fusion output).
+        layer_m = re.search(r"_L(\d+|final|fusion)_", f.name)
+        pool_m  = re.search(r"_L(?:\d+|final|fusion)_(average|last)_", f.name)
         if layer_m and pool_m:
             combos.append((layer_m.group(1), pool_m.group(1)))
     combos = sorted(set(combos))
