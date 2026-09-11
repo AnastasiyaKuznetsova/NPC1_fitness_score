@@ -2,7 +2,6 @@
 #SBATCH --job-name=run_all_janus
 #SBATCH --output=logs/run_all_janus_%j.out
 #SBATCH --error=logs/run_all_janus_%j.err
-#SBATCH --partition=shared
 #SBATCH --reservation=balch
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -33,7 +32,7 @@ for emb_dir in "${EMB_DIRS[@]}"; do
     apptainer exec \
         --bind "$PWD":"$PWD" \
         --pwd "$PWD" \
-        "run_all.sif" \
+        "sif/run_all.sif" \
         python run_all.py \
             --emb "$emb_dir" \
             --out_dir "results_${label}" \
