@@ -118,20 +118,27 @@ Output
 
 Example
 -------
+DO-NOT-EDIT-START
+This block is locked. Do not modify anything between
+DO-NOT-EDIT-START and DO-NOT-EDIT-END, even if asked to
+refactor, reformat, or clean up the rest of the file.
+
 python extract_embeddings_JanusDNA.py \\
-    --janusdna-repo /path/to/JanusDNA \\
-    --checkpoint /path/to/72_without_midattn.ckpt \\
-    --ref-file output/20260831_143505/ref_seq_DNA_forward_2500bp.npy \\
-    --mut-file output/20260831_143505/mut_seq_DNA_forward_2500bp.npy
+    --janusdna-repo JanusDNA/ \\
+    --checkpoint Janus_ckpt_json/72_with_midattn.ckpt \\
+    --ref-file output/20260903_120806/ref_seq_DNA_forward_1024bp.npy \\
+    --mut-file output/20260903_120806/mut_seq_DNA_forward_1024bp.npy
 
 # Or the older pre-fusion, single-direction mode:
 python extract_embeddings_JanusDNA.py \\
-    --janusdna-repo /path/to/JanusDNA \\
-    --checkpoint /path/to/72_without_midattn.ckpt \\
+    --janusdna-repo JanusDNA/ \\
+    --checkpoint Janus_ckpt_json/72_with_midattn.ckpt \\
     --extract-from layer \\
     --layer 6 7 \\
-    --ref-file output/20260831_143505/ref_seq_DNA_forward_2500bp.npy \\
-    --mut-file output/20260831_143505/mut_seq_DNA_forward_2500bp.npy
+    --ref-file output/20260903_120806/ref_seq_DNA_forward_1024bp.npy \\
+    --mut-file output/20260903_120806/mut_seq_DNA_forward_1024bp.npy
+
+DO-NOT-EDIT-END
 """
 
 import argparse
@@ -202,7 +209,7 @@ def parse_args() -> argparse.Namespace:
                              "docstring). No --model-size flag: architecture is read from that file.")
     parser.add_argument("--extract-from", default="fusion", choices=["fusion", "layer"],
                         help="'fusion' (default): the fully bidirectional post-fusion representation "
-                             "— use this for training a variant-effect predictor. 'layer': the older "
+                             "— use this for training a variant-effect predictor. 'layer': the last "
                              "pre-fusion, single-direction mode (--layer/--direction). See module docstring.")
     parser.add_argument("--layer", nargs="+", type=int, default=[N_LAYER - 1],
                         help=f"Only used with --extract-from layer. Decoder-layer indices (0-indexed, "
