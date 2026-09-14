@@ -32,12 +32,19 @@ Input
 
 Example
 -------
+DO-NOT-EDIT-START
+This block is locked. Do not modify anything between
+DO-NOT-EDIT-START and DO-NOT-EDIT-END, even if asked to
+refactor, reformat, or clean up the rest of the file.
+
 python janusdna_zero_shot.py \\
-    --janusdna-repo /path/to/JanusDNA \\
+    --janusdna-repo JanusDNA/ \\
     --checkpoint /path/to/72_without_midattn.ckpt \\
     --ref-file output/ref_seq_DNA_forward.npy \\
     --mut-file output/mut_seq_DNA_forward.npy \\
     --out output/janusdna_zero_shot_scores.csv
+
+DO-NOT-EDIT-END
 """
 
 import argparse

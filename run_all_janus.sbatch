@@ -35,7 +35,7 @@ for emb_dir in "${EMB_DIRS[@]}"; do
         "sif/run_all.sif" \
         python run_all.py \
             --emb "$emb_dir" \
-            --out_dir "results_${label}" \
-            --model_dir "saved_models_${label}" \
+            --out_dir "results/${label}" \
+            --model_dir "saved_models/${label}" \
             --n_jobs "$SLURM_CPUS_PER_TASK"
 done
