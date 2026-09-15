@@ -1,0 +1,159 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+# =============================================================================
+# Caduceus (Ph / Ps) — Apptainer/Singularity container (no conda required)
+#
+# Unlike JanusDNA, Caduceus is hosted directly on the HF Hub
+# (kuleshov-group/caduceus-{ph,ps}_...) with trust_remote_code=True, so no
+# local repo clone is needed — modeling_caduceus.py / tokenization_caduceus.py
+# are pulled at runtime, same as DNABERT-2. But its remote code does
+# `from mamba_ssm.modules.mamba_simple import Mamba`, so it needs the same
+# mamba_ssm/causal-conv1d compiled-CUDA-kernel setup as janusdna.def:
+#   - Python 3.11, PyTorch 2.8.0 (cu128) for native Blackwell (sm_100/sm_120,
+#     e.g. RTX PRO 6000) kernel support.
+#   - mamba_ssm==2.3.1 / causal-conv1d==1.7.0 built FROM SOURCE against the
+#     installed torch (not a prebuilt wheel, which is ABI-fragile across
+#     torch patch builds — see janusdna.def for the detailed rationale).
+#     2.3.1 (not the newer 2.3.2.post1) avoids a triton>=3.5.0 requirement
+#     from its new Mamba-3 module that conflicts with torch 2.8.0's own
+#     triton==3.4.0 pin; Caduceus only imports mamba_ssm.modules.mamba_simple
+#     (Mamba1), so Mamba-3 is unused dead weight either way.
+#   - transformers==4.49.0: same pin as janusdna.def, confirmed to still
+#     export BaseModelOutputWithNoAttention (imported by modeling_caduceus.py).
+#
+# BUILD (needs sudo/root or --fakeroot):
+#   apptainer build caduceus.sif caduceus.def
+#
+# RUN (from the Genomic_model directory, so scripts/output are visible):
+#   apptainer exec --nv --bind "$PWD":"$PWD" --pwd "$PWD" caduceus.sif \
+#       python3 extract_embeddings_Caduceus.py --variant ph \
+#       --ref-file output/.../ref_seq_DNA_forward_8192bp.npy \
+#       --mut-file output/.../mut_seq_DNA_forward_8192bp.npy
+#
+# Check your GPU's actual compute capability with:
+#   apptainer exec --nv caduceus.sif nvidia-smi --query-gpu=name,compute_cap --format=csv
+# =============================================================================
+
+%post
+    set -eux
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ---- System packages -----------------------------------------------------
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        software-properties-common \
+        ca-certificates \
+        wget curl git \
+        build-essential
+
+    # Python 3.11 (Ubuntu 22.04 ships 3.10 by default)
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev
+    rm -rf /var/lib/apt/lists/*
+
+    # ---- Isolated virtualenv --------------------------------------------------
+    python3.11 -m venv /opt/venv
+    . /opt/venv/bin/activate
+    python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+    # ---- PyTorch (CUDA 12.8 — needed for Blackwell sm_100/sm_120 kernels) -----
+    pip install --no-cache-dir \
+        torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+        --index-url https://download.pytorch.org/whl/cu128
+
+    # ---- Build-time deps needed before compiling mamba_ssm/causal-conv1d ------
+    # (their setup.py imports packaging/ninja/einops/psutil at build time) +
+    # everything modeling_caduceus.py / extract_embeddings_Caduceus.py import
+    # at runtime. triton==3.4.0 (not a lower pin): torch==2.8.0's own PyPI
+    # metadata requires triton==3.4.0 exactly, and mamba-ssm==2.3.1's
+    # selective-scan kernels need triton>=3.3.0 for tl.set_allocator — see
+    # janusdna.def for the same reasoning.
+    pip install --no-cache-dir \
+        einops==0.8.0 \
+        packaging==24.2 \
+        ninja==1.11.1.3 \
+        psutil \
+        triton==3.4.0 \
+        transformers==4.49.0 \
+        numpy==1.26.0 \
+        pandas==2.1.4
+
+    # ---- mamba_ssm / causal-conv1d, compiled from source ----------------------
+    # Same recipe/versions as janusdna.def (see that file for the full
+    # rationale): prebuilt wheels are ABI-fragile across torch patch builds,
+    # and mamba-ssm==2.3.1/causal-conv1d==1.7.0 are the newest versions that
+    # (a) gate in Blackwell sm_100/sm_120 gencode support and (b) don't pull
+    # in mamba-ssm's Mamba-3 module (which needs triton>=3.5.0, conflicting
+    # with torch 2.8.0's triton==3.4.0 pin).
+    export TORCH_CUDA_ARCH_LIST="8.0 8.6 9.0 12.0+PTX"
+    export CAUSAL_CONV1D_FORCE_BUILD=TRUE
+    export MAMBA_FORCE_BUILD=TRUE
+    export MAX_JOBS=2
+    # --no-deps: both packages' setup.py declare install_requires=["torch", ...]
+    # with no version pin, which can otherwise silently pull a different torch
+    # build and cause an ABI mismatch at import time — see janusdna.def.
+    pip install --no-cache-dir --no-build-isolation --no-deps causal-conv1d==1.7.0
+    pip install --no-cache-dir --no-build-isolation --no-deps mamba-ssm==2.3.1
+
+    # Byte-compile check (non-fatal)
+    python -c "import torch; print('torch', torch.__version__)" || true
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PATH=/opt/venv/bin:$PATH
+    export VIRTUAL_ENV=/opt/venv
+    export PYTHONNOUSERSITE=1
+    # Keep HF/torch caches inside the bound working dir by default
+    export HF_HOME=${HF_HOME:-$PWD/.hf_cache}
+
+%runscript
+    exec python "$@"
+
+%test
+    . /opt/venv/bin/activate
+    python - <<'PY'
+import torch, mamba_ssm, causal_conv1d, transformers
+print("torch:", torch.__version__, "| CUDA build:", torch.version.cuda)
+print("torch arch list:", torch.cuda.get_arch_list())
+print("transformers:", transformers.__version__)
+print("mamba_ssm + causal_conv1d import OK (built from source)")
+print("CUDA available at test time:", torch.cuda.is_available())
+
+# mamba_ssm.modules.mamba_simple.Mamba is what modeling_caduceus.py imports
+from mamba_ssm.modules.mamba_simple import Mamba
+print("mamba_ssm.modules.mamba_simple.Mamba import OK")
+PY
+
+%labels
+    Application Caduceus
+    Description Bidirectional Mamba DNA language model (Ph / Ps variants), conda-free container
+    Python 3.11
+    PyTorch 2.8.0+cu128
+    Source https://huggingface.co/kuleshov-group
+
+%help
+    Conda-free Apptainer container for Caduceus-Ph / Caduceus-Ps.
+
+    Build:
+        apptainer build caduceus.sif caduceus.def
+    Run:
+        apptainer run   --nv caduceus.sif                  # launches python
+        apptainer exec  --nv caduceus.sif python script.py
+        apptainer shell --nv caduceus.sif
+
+    Notes:
+      * Requires an NVIDIA GPU + driver on the host; pass --nv.
+      * mamba_ssm/causal-conv1d are compiled from source at build time
+        targeting Ampere/Hopper/Blackwell (sm_80/86/90/120), so the same
+        .sif runs on any of them. Check your GPU's compute capability with:
+            apptainer exec --nv caduceus.sif nvidia-smi --query-gpu=name,compute_cap --format=csv
+      * Caduceus's modeling/tokenizer code is pulled from the HF Hub at
+        runtime via trust_remote_code=True (needs network access on first
+        run) — no local repo clone needed, unlike JanusDNA.
+      * Model choice is via extract_embeddings_Caduceus.py's --variant
+        {ph,ps} flag (or --model to override the HF repo id directly).
