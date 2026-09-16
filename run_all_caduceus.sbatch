@@ -10,12 +10,12 @@
 
 set -euo pipefail
 
-cd "${$SLURM_SUBMIT_DIR:-$PWD}"
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
-[ -f "output/df_preprocessed.csv" ] || {echo "Missing output/df_preprocessed.csv under $PWD}" >&2; exit 1; }
+[ -f "output/df_preprocessed.csv" ] || { echo "Missing output/df_preprocessed.csv under $PWD" >&2; exit 1; }
 
 mapfile -t EMB_DIRS < <(find embeddings -maxdepth 1 -type d -name "Caduceus_*_emb" | sort)
-[ "${#EMB_DIRS[@]}" -gt 0 ] || {echo "No embeddings Caduceus_*_emb were found under $PWD" >&2; exit 1; }
+[ "${#EMB_DIRS[@]}" -gt 0 ] || { echo "No embeddings Caduceus_*_emb were found under $PWD" >&2; exit 1; }
 echo "Found ${#EMB_DIRS[@]} Caduceus embedding dir(s): ${EMB_DIRS[*]}"
 
 for emb_dir in "${EMB_DIRS[@]}"; do
