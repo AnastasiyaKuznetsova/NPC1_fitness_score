@@ -13,6 +13,8 @@ Models (--model, default: all three):
   dnabert2  Reads dnabert2_delta_score from
             output/dnabert2_zero_shot_scores.csv (see dnabert2_zero_shot.py).
             Row-aligned with --df.
+  gpn       Reads GPN_effect_score from output/gpn_star_scores.csv (see
+            gpn_star_score.py). Matched to --df by (pos, ref, alt).
 
 Models whose score file is missing or empty are skipped (with a message)
 rather than failing the whole comparison.
@@ -60,7 +62,20 @@ def run_cadd(args, df: pd.DataFrame):
     return merged["Function Score"], merged["CADD_RawScore"]
 
 
-MODELS = {"evo2": run_evo2, "cadd": run_cadd, "dnabert2": run_dnabert2}
+def run_gpn(args, df: pd.DataFrame):
+    gpn = pd.read_csv(args.gpn_file)
+    merged = df.merge(
+        gpn,
+        left_on=["end", "reference_base", "alternate_base"],
+        right_on=["pos", "ref", "alt"],
+        how="inner",
+    )
+    print(f"Matched {len(merged)}/{len(df)} variants to GPN-Star scores in {args.gpn_file}")
+    merged = merged.dropna(subset=["GPN_effect_score"])
+    return merged["Function Score"], merged["GPN_effect_score"]
+
+
+MODELS = {"evo2": run_evo2, "cadd": run_cadd, "dnabert2": run_dnabert2, "gpn": run_gpn}
 
 
 def main():
@@ -79,6 +94,8 @@ def main():
                         help="[cadd] Output of cadd_score.py. Default: output/cadd_scores.csv")
     parser.add_argument("--dnabert2-file", default="output/dnabert2_zero_shot_scores.csv",
                         help="[dnabert2] Output of dnabert2_zero_shot.py. Default: output/dnabert2_zero_shot_scores.csv")
+    parser.add_argument("--gpn-file", default="output/gpn_star_scores.csv",
+                        help="[gpn] Output of gpn_star_score.py. Default: output/gpn_star_scores.csv")
     parser.add_argument("--out", default="output/benchmark_zero_shot_results.csv",
                         help="Output CSV path. Default: output/benchmark_zero_shot_results.csv")
 
