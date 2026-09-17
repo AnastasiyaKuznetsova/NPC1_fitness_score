@@ -1,0 +1,100 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+# =============================================================================
+# Nucleotide Transformer v2 (NT-v2) — Apptainer/Singularity container
+#
+# NT-v2 (InstaDeepAI/nucleotide-transformer-v2-{50m,100m,250m,500m}-multi-species)
+# is hosted directly on the HF Hub with trust_remote_code=True, same as
+# DNABERT-2/Caduceus — its custom ESM-based modeling/tokenizer code is pulled
+# at runtime, no local repo clone needed. No compiled CUDA kernels (unlike
+# Caduceus/JanusDNA's mamba_ssm), so this is a plain pip install, same shape
+# as dnabert2.def.
+#
+# The model card's own install instructions (from the 2023 release) say to
+# install transformers from git source because the stable PyPI release at
+# the time lacked a class its remote code depends on. That gap has long
+# since been covered by any recent stable release, so this pins a modern
+# released transformers (same version Caduceus's remote code is confirmed
+# against) instead of building from git.
+#
+# BUILD (needs sudo/root or --fakeroot):
+#   apptainer build ntv2.sif ntv2.def
+#
+# RUN (from the Genomic_model directory, so scripts/output are visible):
+#   apptainer exec --nv --bind "$PWD":"$PWD" --pwd "$PWD" ntv2.sif \
+#       python3 extract_embeddings_NTv2.py \
+#       --ref-file output/.../ref_seq_DNA_forward_2500bp.npy \
+#       --mut-file output/.../mut_seq_DNA_forward_2500bp.npy
+# =============================================================================
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3.10 python3-pip python3.10-dev \
+        ca-certificates git
+    rm -rf /var/lib/apt/lists/*
+
+    python3.10 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+    # torch built for CUDA 12.8, with native Blackwell (sm_120) support
+    python3.10 -m pip install --no-cache-dir \
+        "torch>=2.7" \
+        --extra-index-url https://download.pytorch.org/whl/cu128
+
+    python3.10 -m pip install --no-cache-dir \
+        transformers==4.49.0 \
+        accelerate==0.34.2 \
+        "numpy<2" pandas
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+    # Apptainer auto-binds the host $HOME; without these, python3.10 can pick
+    # up a numpy from the host's ~/.local user-site (built for a different
+    # python/glibc), which torch silently treats as "not available" and
+    # raises RuntimeError: Numpy is not available on any .numpy() call.
+    export PYTHONNOUSERSITE=1
+    unset PYTHONPATH
+    # Keep HF cache inside the bound working dir by default
+    export HF_HOME=${HF_HOME:-$PWD/.hf_cache}
+
+%runscript
+    exec python3.10 "$@"
+
+%test
+    python3.10 - <<'PY'
+import torch, transformers
+print("torch:", torch.__version__, "| CUDA available:", torch.cuda.is_available())
+print("transformers:", transformers.__version__)
+PY
+
+%labels
+    Application Nucleotide-Transformer-v2
+    Description Environment for NT-v2 embedding extraction
+    Python 3.10
+    PyTorch 2.7+/cu128
+    Source https://huggingface.co/InstaDeepAI
+
+%help
+    Apptainer container for Nucleotide Transformer v2 (tokenizer + model).
+
+    Build:
+        apptainer build ntv2.sif ntv2.def
+    Run:
+        apptainer exec --nv --bind "$PWD":"$PWD" --pwd "$PWD" ntv2.sif \
+            python3 extract_embeddings_NTv2.py \
+            --ref-file output/.../ref_seq_DNA_forward_2500bp.npy \
+            --mut-file output/.../mut_seq_DNA_forward_2500bp.npy
+
+    Notes:
+      * --nv is only needed for GPU (model forward passes).
+      * trust_remote_code=True downloads NT-v2's custom modeling code from
+        the HF Hub on first run — needs network access at runtime.
+      * Model size is selected via extract_embeddings_NTv2.py's --model flag
+        (default: nucleotide-transformer-v2-50m-multi-species; other sizes:
+        100m, 250m, 500m).
