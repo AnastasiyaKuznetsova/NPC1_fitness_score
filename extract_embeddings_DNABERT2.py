@@ -60,7 +60,8 @@ import re
 import numpy as np
 import pandas as pd
 import torch
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
+from transformers.models.bert.configuration_bert import BertConfig
 
 from embedding_utils import parse_context_window, parse_downstream_k
 
@@ -238,12 +239,15 @@ if __name__ == "__main__":
     print(f"Loading {args.model} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
+    # DNABERT-2's model card says AutoConfig silently mishandles its custom
+    # config on transformers > 4.28 -- load BertConfig directly instead.
+    config = BertConfig.from_pretrained(args.model)
+
     # DNABERT-2 ships a Triton flash-attention kernel that uses a removed API
     # (tl.dot(..., trans_b=True)) and fails to compile on Triton 2.x/3.x. Its
     # bert_layers.py takes the pure-PyTorch attention path whenever attention
     # dropout is nonzero, so set it here. eval() makes nn.Dropout an identity,
     # so embeddings are unchanged -- this only selects the attention implementation.
-    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     config.attention_probs_dropout_prob = 0.1
     model = AutoModel.from_pretrained(
         args.model, config=config, trust_remote_code=True
