@@ -3,6 +3,7 @@
 #SBATCH --output=logs/extract_emb_ntv2_%j.out
 #SBATCH --error=logs/extract_emb_ntv2_%j.err
 #SBATCH --partition=gpu
+#SBATCH --reservation=balch
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
