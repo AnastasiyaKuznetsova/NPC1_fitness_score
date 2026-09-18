@@ -15,6 +15,8 @@ Models (--model, default: all three):
             Row-aligned with --df.
   gpn       Reads GPN_effect_score from output/gpn_star_scores.csv (see
             gpn_star_score.py). Matched to --df by (pos, ref, alt).
+  phylop    Reads PhyloP_score from output/phylop_scores.csv (see
+            phylop_score.py). Matched to --df by (pos, ref, alt).
 
 Models whose score file is missing or empty are skipped (with a message)
 rather than failing the whole comparison.
@@ -75,7 +77,20 @@ def run_gpn(args, df: pd.DataFrame):
     return merged["Function Score"], merged["GPN_effect_score"]
 
 
-MODELS = {"evo2": run_evo2, "cadd": run_cadd, "dnabert2": run_dnabert2, "gpn": run_gpn}
+def run_phylop(args, df: pd.DataFrame):
+    phylop = pd.read_csv(args.phylop_file)
+    merged = df.merge(
+        phylop,
+        left_on=["end", "reference_base", "alternate_base"],
+        right_on=["pos", "ref", "alt"],
+        how="inner",
+    )
+    print(f"Matched {len(merged)}/{len(df)} variants to PhyloP scores in {args.phylop_file}")
+    merged = merged.dropna(subset=["PhyloP_score"])
+    return merged["Function Score"], merged["PhyloP_score"]
+
+
+MODELS = {"evo2": run_evo2, "cadd": run_cadd, "dnabert2": run_dnabert2, "gpn": run_gpn, "phylop": run_phylop}
 
 
 def main():
@@ -96,6 +111,8 @@ def main():
                         help="[dnabert2] Output of dnabert2_zero_shot.py. Default: output/dnabert2_zero_shot_scores.csv")
     parser.add_argument("--gpn-file", default="output/gpn_star_scores.csv",
                         help="[gpn] Output of gpn_star_score.py. Default: output/gpn_star_scores.csv")
+    parser.add_argument("--phylop-file", default="output/phylop_scores.csv",
+                        help="[phylop] Output of phylop_score.py. Default: output/phylop_scores.csv")
     parser.add_argument("--out", default="output/benchmark_zero_shot_results.csv",
                         help="Output CSV path. Default: output/benchmark_zero_shot_results.csv")
 
