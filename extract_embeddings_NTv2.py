@@ -48,6 +48,7 @@ Example
 -------
 apptainer exec --nv --bind "$PWD":"$PWD" --pwd "$PWD" sif/ntv2.sif python3 \\
     extract_embeddings_NTv2.py \\
+    --model InstaDeepAI/nucleotide-transformer-v2-500m-multi-species \\
     --ref-file output/20260831_143505/ref_seq_DNA_forward_2500bp.npy \\
     --mut-file output/20260831_143505/mut_seq_DNA_forward_2500bp.npy
 """
