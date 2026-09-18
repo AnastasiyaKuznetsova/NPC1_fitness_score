@@ -51,6 +51,10 @@ def main():
                         help="Layer index (e.g. 27). Required for multi-layer directories.")
     parser.add_argument("--pooling", choices=["average", "last"], default=None,
                         help="Pooling mode. Required for multi-layer directories.")
+    parser.add_argument("--downstream-k", default=None,
+                        help="Select extract_embeddings.py's --pool-region downstream output "
+                             "for this k (e.g. 0, 32, 128, or 'all'). Must match training. "
+                             "Default: plain full-sequence embeddings (no '_ds' suffix).")
     parser.add_argument("--out", default="predictions.csv",
                         help="Output CSV path. Default: predictions.csv")
 
@@ -67,13 +71,16 @@ def main():
     # ── Load embeddings ─────────────────────────────────────────────────────────
     emb_dir = Path(args.emb)
     if args.strand == "both":
-        ref_fwd, mut_fwd = _load_ref_mut(emb_dir, "forward", layer=args.layer, pooling=args.pooling)
+        ref_fwd, mut_fwd = _load_ref_mut(emb_dir, "forward", layer=args.layer, pooling=args.pooling,
+                                          downstream_k=args.downstream_k)
         emb_fwd = _pool(ref_fwd, mut_fwd, args.delta)
-        ref_rev, mut_rev = _load_ref_mut(emb_dir, "reverse", layer=args.layer, pooling=args.pooling)
+        ref_rev, mut_rev = _load_ref_mut(emb_dir, "reverse", layer=args.layer, pooling=args.pooling,
+                                          downstream_k=args.downstream_k)
         emb_rev = _pool(ref_rev, mut_rev, args.delta)
         X = np.concatenate([emb_fwd, emb_rev], axis=1)
     else:
-        ref, mut = _load_ref_mut(emb_dir, args.strand, layer=args.layer, pooling=args.pooling)
+        ref, mut = _load_ref_mut(emb_dir, args.strand, layer=args.layer, pooling=args.pooling,
+                                  downstream_k=args.downstream_k)
         X = _pool(ref, mut, args.delta)
 
     print(f"Embedding shape: {X.shape}")
