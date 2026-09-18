@@ -45,8 +45,8 @@ EMB_TYPE="average"
 
 # model_size:window_bp:dataset_dir
 RUNS=(
-    "50m:5994:${DATASET_DIR_5994}"
-    "100m:5994:${DATASET_DIR_5994}"
+    #"50m:5994:${DATASET_DIR_5994}"
+    #"100m:5994:${DATASET_DIR_5994}"
     "250m:5994:${DATASET_DIR_5994}"
     "500m:8190:${DATASET_DIR_8190}"
 )
